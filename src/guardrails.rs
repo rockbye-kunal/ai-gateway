@@ -5,11 +5,16 @@
 //! strings and `text` parts), and embeddings `input`. Redaction happens before
 //! the request leaves the gateway, before caching and before logging.
 
+use std::collections::HashMap;
+
 use anyhow::{bail, Context, Result};
 use regex::Regex;
-use serde_json::Value;
+use serde_json::{json, Value};
 
-use crate::config::{valid_ident, GuardAction, GuardScope, GuardrailsConfig};
+use crate::{
+    app::{AppState, Runtime},
+    config::{valid_ident, GuardAction, GuardScope, GuardrailsConfig, ModerationConfig},
+};
 
 /// Built-in detectors: (name, pattern, description).
 pub const BUILTINS: &[(&str, &str, &str)] = &[
@@ -38,19 +43,38 @@ pub const BUILTINS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+enum Matcher {
+    Regex { re: Regex, luhn: bool },
+    Moderation(ModerationConfig),
+}
+
 struct Rule {
     name: String,
-    re: Regex,
+    matcher: Matcher,
     action: GuardAction,
     on_request: bool,
     on_response: bool,
-    luhn: bool,
 }
 
 impl Rule {
-    fn accepts(&self, m: &str) -> bool {
-        !self.luhn || luhn_valid(m)
+    fn regex(&self) -> Option<(&Regex, bool)> {
+        match &self.matcher {
+            Matcher::Regex { re, luhn } => Some((re, *luhn)),
+            Matcher::Moderation(_) => None,
+        }
     }
+
+    fn applies(&self, request: bool) -> bool {
+        if request {
+            self.on_request
+        } else {
+            self.on_response
+        }
+    }
+}
+
+fn accepts(luhn: bool, m: &str) -> bool {
+    !luhn || luhn_valid(m)
 }
 
 #[derive(Default)]
@@ -78,28 +102,38 @@ impl Guardrails {
             if !names.insert(r.name.as_str()) {
                 bail!("duplicate guardrail name '{}'", r.name);
             }
-            let (pattern, luhn) = match (&r.builtin, &r.pattern) {
-                (Some(b), None) => {
+            let compile = |pattern: &str| {
+                regex::RegexBuilder::new(pattern)
+                    .size_limit(1 << 20)
+                    .build()
+                    .with_context(|| format!("guardrail '{}': invalid pattern", r.name))
+            };
+            let matcher = match (&r.builtin, &r.pattern, &r.moderation) {
+                (Some(b), None, None) => {
                     let Some((_, p, _)) = BUILTINS.iter().find(|(n, _, _)| n == b) else {
                         let known: Vec<&str> = BUILTINS.iter().map(|(n, _, _)| *n).collect();
                         bail!("guardrail '{}': unknown builtin '{b}' (known: {})", r.name, known.join(", "));
                     };
-                    (p.to_string(), b == "credit_card")
+                    Matcher::Regex { re: compile(p)?, luhn: b == "credit_card" }
                 }
-                (None, Some(p)) => (p.clone(), false),
-                _ => bail!("guardrail '{}': set exactly one of builtin or pattern", r.name),
+                (None, Some(p), None) => Matcher::Regex { re: compile(p)?, luhn: false },
+                (None, None, Some(m)) => {
+                    if m.action_is_redact(r.action) {
+                        bail!("guardrail '{}': moderation rules can block or flag, not redact", r.name);
+                    }
+                    if m.threshold.is_some_and(|t| !(0.0..=1.0).contains(&t)) {
+                        bail!("guardrail '{}': moderation threshold must be between 0 and 1", r.name);
+                    }
+                    Matcher::Moderation(m.clone())
+                }
+                _ => bail!("guardrail '{}': set exactly one of builtin, pattern or moderation", r.name),
             };
-            let re = regex::RegexBuilder::new(&pattern)
-                .size_limit(1 << 20)
-                .build()
-                .with_context(|| format!("guardrail '{}': invalid pattern", r.name))?;
             rules.push(Rule {
                 name: r.name.clone(),
-                re,
+                matcher,
                 action: r.action,
                 on_request: r.apply_to != GuardScope::Response,
                 on_response: r.apply_to != GuardScope::Request,
-                luhn,
             });
         }
         Ok(Self { rules })
@@ -113,11 +147,17 @@ impl Guardrails {
         self.rules.iter().any(|r| r.on_response)
     }
 
+    pub fn has_moderation(&self, request: bool) -> bool {
+        self.rules.iter().any(|r| matches!(r.matcher, Matcher::Moderation(_)) && r.applies(request))
+    }
+
     pub fn rule_summaries(&self) -> Vec<(String, &'static str, bool, bool)> {
         self.rules
             .iter()
             .map(|r| {
                 let action = match r.action {
+                    GuardAction::Block if matches!(r.matcher, Matcher::Moderation(_)) => "block (moderation)",
+                    GuardAction::Flag if matches!(r.matcher, Matcher::Moderation(_)) => "flag (moderation)",
                     GuardAction::Block => "block",
                     GuardAction::Redact => "redact",
                     GuardAction::Flag => "flag",
@@ -127,69 +167,36 @@ impl Guardrails {
             .collect()
     }
 
-    /// Checks (and redacts in place) a chat or embeddings request body.
+    /// Checks (and redacts in place) the text of any request body: chat and
+    /// Messages turns and system prompts, Responses/embeddings/moderation
+    /// `input`, image `prompt`, rerank `query` and `documents`.
     pub fn check_request(&self, req: &mut Value) -> Outcome {
         let mut out = Outcome::default();
-        if !self.rules.iter().any(|r| r.on_request) {
+        if !self.rules.iter().any(|r| r.on_request && r.regex().is_some()) {
             return out;
         }
-        if let Some(messages) = req.get_mut("messages").and_then(Value::as_array_mut) {
-            for m in messages {
-                if let Some(content) = m.get_mut("content") {
-                    self.scan_content(content, true, &mut out);
-                }
-            }
-        }
-        if let Some(input) = req.get_mut("input") {
-            self.scan_content(input, true, &mut out);
-        }
+        visit_request(req, &mut |s| self.scan_text(s, true, &mut out));
         out
     }
 
-    /// Checks (and redacts in place) a non-streaming chat completion.
+    /// Checks (and redacts in place) a non-streaming response: chat
+    /// completions, Messages API and Responses API shapes.
     pub fn check_response(&self, resp: &mut Value) -> Outcome {
         let mut out = Outcome::default();
-        if !self.has_response_rules() {
+        if !self.rules.iter().any(|r| r.on_response && r.regex().is_some()) {
             return out;
         }
-        if let Some(choices) = resp.get_mut("choices").and_then(Value::as_array_mut) {
-            for c in choices {
-                if let Some(content) = c.get_mut("message").and_then(|m| m.get_mut("content")) {
-                    self.scan_content(content, false, &mut out);
-                }
-            }
-        }
+        visit_response(resp, &mut |s| self.scan_text(s, false, &mut out));
         out
-    }
-
-    /// Content is a string, an array of strings (embeddings input), or an
-    /// array of parts where `text` parts carry the text.
-    fn scan_content(&self, v: &mut Value, request: bool, out: &mut Outcome) {
-        match v {
-            Value::String(s) => self.scan_text(s, request, out),
-            Value::Array(items) => {
-                for item in items {
-                    match item {
-                        Value::String(s) => self.scan_text(s, request, out),
-                        Value::Object(o) => {
-                            if let Some(Value::String(s)) = o.get_mut("text") {
-                                self.scan_text(s, request, out);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
-        }
     }
 
     fn scan_text(&self, text: &mut String, request: bool, out: &mut Outcome) {
         for rule in &self.rules {
-            if (request && !rule.on_request) || (!request && !rule.on_response) {
+            if !rule.applies(request) {
                 continue;
             }
-            if !rule.re.find_iter(text).any(|m| rule.accepts(m.as_str())) {
+            let Some((re, luhn)) = rule.regex() else { continue };
+            if !re.find_iter(text).any(|m| accepts(luhn, m.as_str())) {
                 continue;
             }
             if !out.hits.contains(&rule.name) {
@@ -202,9 +209,9 @@ impl Guardrails {
                     }
                 }
                 GuardAction::Redact => {
-                    let replaced = rule.re.replace_all(text, |caps: &regex::Captures<'_>| {
+                    let replaced = re.replace_all(text, |caps: &regex::Captures<'_>| {
                         let m = &caps[0];
-                        if rule.accepts(m) {
+                        if accepts(luhn, m) {
                             format!("[REDACTED:{}]", rule.name)
                         } else {
                             m.to_string()
@@ -216,6 +223,156 @@ impl Guardrails {
             }
         }
     }
+}
+
+impl ModerationConfig {
+    fn action_is_redact(&self, a: GuardAction) -> bool {
+        a == GuardAction::Redact
+    }
+
+    /// Whether a moderation result matches this rule.
+    fn matches(&self, result: &Value) -> bool {
+        let flagged = result.get("flagged").and_then(Value::as_bool).unwrap_or(false);
+        let scores = result.get("category_scores").and_then(Value::as_object);
+        let cats = result.get("categories").and_then(Value::as_object);
+        let hit = |name: &str| -> bool {
+            match self.threshold {
+                Some(t) => scores.and_then(|s| s.get(name)).and_then(Value::as_f64).is_some_and(|v| v >= t),
+                None => cats.and_then(|c| c.get(name)).and_then(Value::as_bool).unwrap_or(false),
+            }
+        };
+        let all: Vec<String> = cats.map(|c| c.keys().cloned().collect()).unwrap_or_default();
+        if self.categories.is_empty() {
+            return match self.threshold {
+                Some(_) => all.iter().any(|c| hit(c)),
+                None => flagged,
+            };
+        }
+        // "violence" also covers "violence/graphic" and similar sub-categories.
+        all.iter().any(|c| {
+            self.categories.iter().any(|want| c == want || c.starts_with(&format!("{want}/"))) && hit(c)
+        })
+    }
+}
+
+impl Guardrails {
+    /// Runs moderation rules for `text` (request or response stage). Each
+    /// distinct provider+model is called once.
+    pub async fn moderate(&self, app: &AppState, rt: &Runtime, text: &str, request: bool) -> Outcome {
+        let mut out = Outcome::default();
+        if text.trim().is_empty() {
+            return out;
+        }
+        let mut results: HashMap<(String, String), Option<Value>> = HashMap::new();
+        for rule in &self.rules {
+            let Matcher::Moderation(m) = &rule.matcher else { continue };
+            if !rule.applies(request) {
+                continue;
+            }
+            let k = (m.provider.clone(), m.model.clone());
+            if !results.contains_key(&k) {
+                let r = call_moderation(app, rt, m, text).await;
+                results.insert(k.clone(), r);
+            }
+            let hit = match &results[&k] {
+                Some(result) => m.matches(result),
+                None if m.fail_open => false,
+                None => true,
+            };
+            if !hit {
+                continue;
+            }
+            if !out.hits.contains(&rule.name) {
+                out.hits.push(rule.name.clone());
+            }
+            if rule.action == GuardAction::Block && out.blocked_by.is_none() {
+                out.blocked_by = Some(rule.name.clone());
+            }
+        }
+        out
+    }
+}
+
+async fn call_moderation(app: &AppState, rt: &Runtime, m: &ModerationConfig, text: &str) -> Option<Value> {
+    let provider = rt.providers.get(&m.provider)?;
+    let key = crate::proxy::credentials(app, provider, &Default::default()).0;
+    let input: String = text.chars().take(32_000).collect();
+    let rb = provider.build_json("moderations", &json!({"input": input}), &m.model, &key).ok()?;
+    let res = tokio::time::timeout(provider.timeout(), rb.send()).await;
+    let body: Option<Value> = match res {
+        Ok(Ok(r)) if r.status().is_success() => r.json().await.ok(),
+        Ok(Ok(r)) => {
+            tracing::warn!(status = r.status().as_u16(), provider = %m.provider, "moderation call failed");
+            None
+        }
+        _ => {
+            tracing::warn!(provider = %m.provider, "moderation call failed");
+            None
+        }
+    };
+    if body.is_none() {
+        metrics::counter!("gateway_guardrail_errors_total", "provider" => m.provider.clone()).increment(1);
+    }
+    body.and_then(|b| b.get("results").and_then(|r| r.get(0)).cloned())
+}
+
+/// Visits every string under `text` and `content` keys (recursively).
+fn visit_content(v: &mut Value, f: &mut dyn FnMut(&mut String)) {
+    match v {
+        Value::String(s) => f(s),
+        Value::Array(items) => {
+            for item in items {
+                visit_content(item, f);
+            }
+        }
+        Value::Object(o) => {
+            for k in ["text", "content"] {
+                if let Some(x) = o.get_mut(k) {
+                    visit_content(x, f);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn visit_request(req: &mut Value, f: &mut dyn FnMut(&mut String)) {
+    for field in ["messages", "system", "input", "prompt", "query", "documents"] {
+        if let Some(v) = req.get_mut(field) {
+            visit_content(v, f);
+        }
+    }
+}
+
+fn visit_response(resp: &mut Value, f: &mut dyn FnMut(&mut String)) {
+    if let Some(choices) = resp.get_mut("choices").and_then(Value::as_array_mut) {
+        for c in choices {
+            if let Some(m) = c.get_mut("message") {
+                visit_content(m, f);
+            }
+        }
+    }
+    for field in ["content", "output"] {
+        if let Some(v) = resp.get_mut(field) {
+            visit_content(v, f);
+        }
+    }
+}
+
+/// All the text a request carries, for moderation.
+pub fn request_text(req: &Value) -> String {
+    let mut v = req.clone();
+    let mut parts = Vec::new();
+    visit_request(&mut v, &mut |s| parts.push(s.clone()));
+    parts.join("\n")
+}
+
+/// All the text a response carries, for moderation.
+pub fn response_text(resp: &Value) -> String {
+    let mut v = resp.clone();
+    let mut parts = Vec::new();
+    visit_response(&mut v, &mut |s| parts.push(s.clone()));
+    parts.join("\n")
 }
 
 /// Luhn checksum over the digits of a candidate card number.
@@ -251,7 +408,14 @@ mod tests {
     use serde_json::json;
 
     fn rule(name: &str, builtin: &str, action: GuardAction, apply_to: GuardScope) -> GuardrailRule {
-        GuardrailRule { name: name.into(), builtin: Some(builtin.into()), pattern: None, action, apply_to }
+        GuardrailRule {
+            name: name.into(),
+            builtin: Some(builtin.into()),
+            pattern: None,
+            moderation: None,
+            action,
+            apply_to,
+        }
     }
 
     fn guards(rules: Vec<GuardrailRule>) -> Guardrails {
@@ -325,6 +489,7 @@ mod tests {
                 name: "project".into(),
                 builtin: None,
                 pattern: Some(r"(?i)project\s+falcon".into()),
+                moderation: None,
                 action: GuardAction::Block,
                 apply_to: GuardScope::Both,
             }],
@@ -332,6 +497,47 @@ mod tests {
         .unwrap();
         let mut req = json!({"messages": [{"role": "user", "content": "status of Project Falcon?"}]});
         assert_eq!(g.check_request(&mut req).blocked_by.as_deref(), Some("project"));
+    }
+
+    #[test]
+    fn covers_messages_responses_and_system() {
+        let g = guards(vec![rule("email", "email", GuardAction::Redact, GuardScope::Both)]);
+        let mut req = json!({
+            "system": "admin is a@b.co",
+            "messages": [{"role": "user", "content": [{"type": "tool_result", "content": [{"type": "text", "text": "x@y.io"}]}]}],
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "z@w.io"}]}]
+        });
+        g.check_request(&mut req);
+        let s = req.to_string();
+        assert!(!s.contains("a@b.co") && !s.contains("x@y.io") && !s.contains("z@w.io"), "{s}");
+        let mut resp = json!({"output": [{"type": "message", "content": [{"type": "output_text", "text": "mail q@r.io"}]}]});
+        g.check_response(&mut resp);
+        assert_eq!(resp["output"][0]["content"][0]["text"], "mail [REDACTED:email]");
+        let mut msg = json!({"content": [{"type": "text", "text": "q@r.io"}]});
+        g.check_response(&mut msg);
+        assert_eq!(msg["content"][0]["text"], "[REDACTED:email]");
+        assert!(request_text(&json!({"messages": [{"content": "hi"}], "prompt": "draw"})).contains("draw"));
+    }
+
+    #[test]
+    fn moderation_matching() {
+        let m = |cats: Vec<&str>, t: Option<f64>| ModerationConfig {
+            provider: "p".into(),
+            model: "m".into(),
+            categories: cats.into_iter().map(String::from).collect(),
+            threshold: t,
+            fail_open: true,
+        };
+        let result = json!({
+            "flagged": true,
+            "categories": {"violence": false, "violence/graphic": true, "hate": false},
+            "category_scores": {"violence": 0.2, "violence/graphic": 0.91, "hate": 0.05}
+        });
+        assert!(m(vec![], None).matches(&result));
+        assert!(m(vec!["violence"], None).matches(&result));
+        assert!(!m(vec!["hate"], None).matches(&result));
+        assert!(m(vec!["hate"], Some(0.01)).matches(&result));
+        assert!(!m(vec!["violence"], Some(0.95)).matches(&result));
     }
 
     #[test]

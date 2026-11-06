@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_yaml::Value;
 
 /// A string that never appears in Debug output or logs.
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, PartialEq, Eq)]
 #[serde(transparent)]
 pub struct Secret(String);
 
@@ -58,6 +58,116 @@ pub struct Config {
     pub logging: LoggingConfig,
     #[serde(default)]
     pub guardrails: GuardrailsConfig,
+    /// Spend, token and request limits, each scoped by key, user, model,
+    /// provider or a metadata field.
+    #[serde(default)]
+    pub limits: Vec<LimitConfig>,
+    /// Model rewrite and deny rules applied before routing.
+    #[serde(default)]
+    pub routing_rules: Vec<RoutingRuleConfig>,
+    #[serde(default)]
+    pub alerts: AlertsConfig,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitKind {
+    /// Number of requests.
+    Requests,
+    /// Prompt plus completion tokens.
+    Tokens,
+    /// Spend in US dollars (provider-reported or configured prices).
+    Cost,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LimitWindow {
+    Minute,
+    Hour,
+    Day,
+    Week,
+    Month,
+}
+
+impl LimitWindow {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LimitWindow::Minute => "minute",
+            LimitWindow::Hour => "hour",
+            LimitWindow::Day => "day",
+            LimitWindow::Week => "week",
+            LimitWindow::Month => "month",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LimitConfig {
+    pub name: String,
+    pub kind: LimitKind,
+    /// Requests, tokens, or US dollars per window.
+    pub limit: f64,
+    pub window: LimitWindow,
+    /// What each bucket is counted per: `global` (default), `key`, `user`,
+    /// `model`, `provider`, or `metadata.<field>`.
+    #[serde(default = "d_global")]
+    pub per: String,
+    /// Only count requests from these API keys (empty = all keys).
+    #[serde(default)]
+    pub keys: Vec<String>,
+    /// Only count requests for these models (`provider/model`, `provider/*`,
+    /// or route names; empty = all).
+    #[serde(default)]
+    pub models: Vec<String>,
+    /// For `requests` limits: smooth the window edge (sliding window
+    /// approximation) instead of resetting at the boundary.
+    #[serde(default)]
+    pub sliding: bool,
+}
+
+fn d_global() -> String {
+    "global".into()
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleAction {
+    /// Serve the request with `destination` instead.
+    Rewrite,
+    /// Reject the request with 403.
+    Deny,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RoutingRuleConfig {
+    /// Model to match: a route name, `provider/model`, `provider/*`, or any
+    /// model string the client sends (with default_provider).
+    pub source: String,
+    pub action: RuleAction,
+    #[serde(default)]
+    pub destination: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AlertsConfig {
+    /// Receives JSON POSTs for limit thresholds and provider circuit changes.
+    pub webhook_url: Option<String>,
+    /// HMAC-SHA256 key; the signature is sent in `x-gateway-signature`.
+    pub webhook_secret: Option<Secret>,
+    /// Fractions of a limit that trigger an alert, once per window each.
+    pub thresholds: Vec<f64>,
+}
+
+impl Default for AlertsConfig {
+    fn default() -> Self {
+        Self { webhook_url: None, webhook_secret: None, thresholds: vec![0.8, 1.0] }
+    }
 }
 
 /// The admin API and dashboard, served on `server.admin_listen`.
@@ -70,11 +180,14 @@ pub struct AdminConfig {
     /// How often each replica reloads API keys created through the admin API.
     /// A key revoked on one replica stops working everywhere within this time.
     pub key_refresh_secs: u64,
+    /// 32 random bytes, base64. Encrypts provider keys stored through the
+    /// admin API (BYOK). Storing provider keys is disabled while unset.
+    pub encryption_key: Option<Secret>,
 }
 
 impl Default for AdminConfig {
     fn default() -> Self {
-        Self { token_sha256: None, key_refresh_secs: 5 }
+        Self { token_sha256: None, key_refresh_secs: 5, encryption_key: None }
     }
 }
 
@@ -92,6 +205,12 @@ pub struct LoggingConfig {
     pub max_body_bytes: usize,
     /// How long a request's full detail (including bodies) is kept.
     pub detail_ttl_secs: u64,
+    /// How long hourly usage reports (by key, user, tag, model, provider) are kept.
+    pub report_retention_days: u64,
+    /// Ship every log entry to an HTTP endpoint (NDJSON batches).
+    pub export: Option<HttpExportConfig>,
+    /// Send an OpenTelemetry trace per request (OTLP/HTTP JSON).
+    pub otlp: Option<OtlpConfig>,
 }
 
 impl Default for LoggingConfig {
@@ -102,8 +221,51 @@ impl Default for LoggingConfig {
             capture_bodies: false,
             max_body_bytes: 32 * 1024,
             detail_ttl_secs: 7 * 86_400,
+            report_retention_days: 90,
+            export: None,
+            otlp: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpExportConfig {
+    pub url: String,
+    #[serde(default)]
+    pub headers: HashMap<String, Secret>,
+    #[serde(default = "d_batch")]
+    pub batch_size: usize,
+    #[serde(default = "d_flush")]
+    pub flush_secs: u64,
+    /// Include prompts and responses (when captured) in exported entries.
+    #[serde(default)]
+    pub include_bodies: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OtlpConfig {
+    /// Collector base URL, e.g. `http://otel-collector:4318`; traces go to `/v1/traces`.
+    pub endpoint: String,
+    #[serde(default)]
+    pub headers: HashMap<String, Secret>,
+    #[serde(default = "d_service")]
+    pub service_name: String,
+    #[serde(default = "d_batch")]
+    pub batch_size: usize,
+    #[serde(default = "d_flush")]
+    pub flush_secs: u64,
+}
+
+fn d_batch() -> usize {
+    100
+}
+fn d_flush() -> u64 {
+    5
+}
+fn d_service() -> String {
+    "ai-gateway".into()
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -132,6 +294,29 @@ pub enum GuardScope {
     Both,
 }
 
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ModerationConfig {
+    pub provider: String,
+    #[serde(default = "d_mod_model")]
+    pub model: String,
+    /// Categories that trigger the rule (empty = any flagged category),
+    /// e.g. `hate`, `harassment`, `self-harm`, `sexual`, `violence`.
+    #[serde(default)]
+    pub categories: Vec<String>,
+    /// Category score at or above which the rule matches (default: the
+    /// provider's own `flagged` decision).
+    #[serde(default)]
+    pub threshold: Option<f64>,
+    /// Let requests through when the moderation call fails (default true).
+    #[serde(default = "d_true")]
+    pub fail_open: bool,
+}
+
+fn d_mod_model() -> String {
+    "omni-moderation-latest".into()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GuardrailRule {
@@ -142,6 +327,10 @@ pub struct GuardrailRule {
     /// A custom regular expression (Rust `regex` syntax).
     #[serde(default)]
     pub pattern: Option<String>,
+    /// A moderation model (OpenAI-compatible `/moderations`) that scores
+    /// prompts and responses by category.
+    #[serde(default)]
+    pub moderation: Option<ModerationConfig>,
     pub action: GuardAction,
     #[serde(default)]
     pub apply_to: GuardScope,
@@ -238,7 +427,7 @@ impl Default for CacheConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
     /// OpenAI and every OpenAI-compatible API (Gemini's /openai endpoint, Groq,
@@ -250,7 +439,7 @@ pub enum ProviderKind {
     Anthropic,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     pub kind: ProviderKind,
@@ -287,6 +476,21 @@ pub struct ProviderConfig {
     /// Values are treated as secrets (redacted in logs, marked sensitive).
     #[serde(default)]
     pub extra_headers: HashMap<String, Secret>,
+    /// The provider account has zero data retention. Requests that ask for
+    /// ZDR only go to providers with this set.
+    #[serde(default)]
+    pub zero_data_retention: bool,
+    /// The provider does not train on prompts. Requests that disallow
+    /// prompt training only go to providers with this set.
+    #[serde(default)]
+    pub no_prompt_training: bool,
+    /// Anthropic: add prompt-caching markers automatically (system prompt and
+    /// latest turn), like `caching: auto`.
+    #[serde(default)]
+    pub auto_prompt_cache: bool,
+    /// Clients may send their own key for this provider (request-scoped BYOK).
+    #[serde(default = "d_true")]
+    pub allow_client_keys: bool,
 }
 
 fn d_max_tokens() -> u64 {
@@ -311,7 +515,7 @@ fn d_open() -> u64 {
     30
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct RouteConfig {
     /// The name clients send as `model`.
@@ -320,9 +524,42 @@ pub struct RouteConfig {
     pub strategy: RouteStrategy,
     /// Tried in order; later targets are fallbacks.
     pub targets: Vec<TargetConfig>,
+    /// Conditional branches, checked in order. The first whose `when`
+    /// matches replaces `targets` (and `strategy`) for that request.
+    #[serde(default)]
+    pub branches: Vec<RouteBranch>,
 }
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct RouteBranch {
+    /// Field → condition. Fields: `key`, `user`, `tags`, `metadata.<name>`.
+    /// A condition is a string (equals) or `{eq|ne|in|not_in|exists}`.
+    pub when: HashMap<String, Condition>,
+    #[serde(default)]
+    pub strategy: RouteStrategy,
+    pub targets: Vec<TargetConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum Condition {
+    Equals(String),
+    Op(ConditionOp),
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, default)]
+pub struct ConditionOp {
+    pub eq: Option<String>,
+    pub ne: Option<String>,
+    #[serde(rename = "in")]
+    pub one_of: Option<Vec<String>>,
+    pub not_in: Option<Vec<String>>,
+    pub exists: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RouteStrategy {
     /// Always start with the first target; the rest are fallbacks in order.
@@ -330,10 +567,15 @@ pub enum RouteStrategy {
     Fallback,
     /// Pick the first target at random by `weight` (A/B tests, gradual
     /// rollouts, load spreading); the others remain fallbacks in order.
+    /// Requests with a session id stick to the same first target.
     Weighted,
+    /// Fastest first, by recent time to first token on this replica.
+    Latency,
+    /// Cheapest first, by configured prices.
+    Cost,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TargetConfig {
     pub provider: String,
@@ -350,7 +592,7 @@ pub struct TargetConfig {
     pub weight: Option<u32>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct KeyConfig {
     /// Tenant / client name used in logs, metrics and limits.
@@ -371,6 +613,10 @@ pub struct KeyConfig {
     pub max_concurrent_requests: Option<usize>,
     /// Route names, `provider/model`, `provider/*`, or `*` for everything.
     pub allowed_models: Vec<String>,
+    /// Never store this key's prompts or responses, never cache them, and only
+    /// use providers marked `zero_data_retention`.
+    #[serde(default)]
+    pub zero_data_retention: bool,
 }
 
 impl Config {
@@ -484,13 +730,23 @@ impl Config {
             if r.targets.is_empty() {
                 bail!("route '{}' has no targets", r.name);
             }
-            if r.strategy == RouteStrategy::Weighted {
-                let total: u64 = r.targets.iter().map(|t| u64::from(t.weight.unwrap_or(1))).sum();
-                if total == 0 {
-                    bail!("route '{}': at least one target needs a weight above 0", r.name);
+            validate_targets(&r.name, r.strategy, &r.targets, self)?;
+            for b in &r.branches {
+                if b.targets.is_empty() {
+                    bail!("route '{}': every branch needs targets", r.name);
                 }
-            } else if r.targets.iter().any(|t| t.weight.is_some()) {
-                bail!("route '{}': weight is only used with strategy: weighted", r.name);
+                if b.when.is_empty() {
+                    bail!("route '{}': every branch needs a when condition", r.name);
+                }
+                for field in b.when.keys() {
+                    if !valid_condition_field(field) {
+                        bail!(
+                            "route '{}': condition field '{field}' must be key, user, tags or metadata.<name>",
+                            r.name
+                        );
+                    }
+                }
+                validate_targets(&r.name, b.strategy, &b.targets, self)?;
             }
             for t in &r.targets {
                 let Some(p) = self.providers.get(&t.provider) else {
@@ -551,8 +807,122 @@ impl Config {
             bail!("logging.detail_ttl_secs must be greater than 0");
         }
         crate::guardrails::Guardrails::compile(&self.guardrails)?;
+        for g in &self.guardrails.rules {
+            if let Some(m) = &g.moderation {
+                match self.providers.get(&m.provider) {
+                    Some(p) if p.kind == ProviderKind::Openai => {}
+                    _ => bail!(
+                        "guardrail '{}': moderation provider '{}' must be a configured openai-kind provider",
+                        g.name,
+                        m.provider
+                    ),
+                }
+            }
+        }
+
+        let mut limit_names = HashSet::new();
+        for l in &self.limits {
+            if !valid_ident(&l.name) {
+                bail!("limit name '{}' may only contain letters, digits, '-', '_' and '.'", l.name);
+            }
+            if !limit_names.insert(l.name.as_str()) {
+                bail!("duplicate limit name '{}'", l.name);
+            }
+            if !(l.limit.is_finite() && l.limit > 0.0) {
+                bail!("limit '{}': limit must be greater than 0", l.name);
+            }
+            if !valid_limit_dimension(&l.per) {
+                bail!(
+                    "limit '{}': per must be global, key, user, model, provider or metadata.<name>",
+                    l.name
+                );
+            }
+            if l.sliding && l.kind != LimitKind::Requests {
+                bail!("limit '{}': sliding only applies to requests limits", l.name);
+            }
+        }
+        for r in &self.routing_rules {
+            if r.source.trim().is_empty() {
+                bail!("routing rule source must not be empty");
+            }
+            match (r.action, &r.destination) {
+                (RuleAction::Rewrite, Some(d)) if valid_model(d) => {}
+                (RuleAction::Rewrite, _) => {
+                    bail!("routing rule for '{}': rewrite needs a valid destination", r.source)
+                }
+                (RuleAction::Deny, _) => {}
+            }
+        }
+        if let Some(u) = &self.alerts.webhook_url {
+            if !(u.starts_with("https://") || is_loopback_url(u) || u.starts_with("http://")) {
+                bail!("alerts.webhook_url must be an http(s) URL");
+            }
+        }
+        if self.alerts.thresholds.iter().any(|t| !(t.is_finite() && *t > 0.0 && *t <= 1.0)) {
+            bail!("alerts.thresholds must be fractions between 0 and 1");
+        }
+        if let Some(k) = &self.admin.encryption_key {
+            crate::secrets::Cipher::from_base64(k.expose())
+                .context("admin.encryption_key must be 32 random bytes, base64-encoded")?;
+        }
+        if let Some(e) = &self.logging.export {
+            if !(e.url.starts_with("https://") || e.url.starts_with("http://")) {
+                bail!("logging.export.url must be an http(s) URL");
+            }
+            if e.batch_size == 0 || e.flush_secs == 0 {
+                bail!("logging.export batch_size and flush_secs must be greater than 0");
+            }
+        }
+        if let Some(o) = &self.logging.otlp {
+            if !(o.endpoint.starts_with("https://") || o.endpoint.starts_with("http://")) {
+                bail!("logging.otlp.endpoint must be an http(s) URL");
+            }
+            if o.batch_size == 0 || o.flush_secs == 0 {
+                bail!("logging.otlp batch_size and flush_secs must be greater than 0");
+            }
+        }
+        if self.logging.report_retention_days == 0 || self.logging.report_retention_days > 400 {
+            bail!("logging.report_retention_days must be between 1 and 400");
+        }
         Ok(())
     }
+}
+
+fn validate_targets(
+    route: &str,
+    strategy: RouteStrategy,
+    targets: &[TargetConfig],
+    cfg: &Config,
+) -> Result<()> {
+    if strategy == RouteStrategy::Weighted {
+        let total: u64 = targets.iter().map(|t| u64::from(t.weight.unwrap_or(1))).sum();
+        if total == 0 {
+            bail!("route '{route}': at least one target needs a weight above 0");
+        }
+    } else if targets.iter().any(|t| t.weight.is_some()) {
+        bail!("route '{route}': weight is only used with strategy: weighted");
+    }
+    for t in targets {
+        let Some(p) = cfg.providers.get(&t.provider) else {
+            bail!("route '{route}' references unknown provider '{}'", t.provider);
+        };
+        if !valid_model(&t.model) {
+            bail!("route '{route}': invalid model name '{}'", t.model);
+        }
+        if p.kind == ProviderKind::Azure && t.model.contains('/') {
+            bail!("route '{route}': azure deployment names cannot contain '/'");
+        }
+    }
+    Ok(())
+}
+
+pub fn valid_condition_field(f: &str) -> bool {
+    matches!(f, "key" | "user" | "tags") || f.strip_prefix("metadata.").is_some_and(|m| !m.is_empty())
+}
+
+pub fn valid_limit_dimension(f: &str) -> bool {
+    matches!(f, "global" | "key" | "user" | "model" | "provider")
+        || f.strip_prefix("metadata.").is_some_and(|m| !m.is_empty())
 }
 
 pub fn is_sha256_hex(s: &str) -> bool {

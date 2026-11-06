@@ -66,65 +66,164 @@ impl Provider {
         Ok(v)
     }
 
-    /// Builds the upstream HTTP request for one target.
-    pub fn build(&self, body: &Value, model: &str, stream: bool) -> Result<RequestBuilder, ApiError> {
-        let base = self.cfg.base_url.trim_end_matches('/');
-        let key = self.cfg.api_key.expose();
+    fn base(&self) -> &str {
+        self.cfg.base_url.trim_end_matches('/')
+    }
+
+    /// Adds this provider's credentials (`key`) in the header it expects.
+    fn authed(&self, rb: RequestBuilder, key: &str) -> Result<RequestBuilder, ApiError> {
+        let rb = match self.cfg.kind {
+            ProviderKind::Openai => rb.bearer_auth(key),
+            ProviderKind::Azure => rb.header("api-key", Self::secret_header(key)?),
+            ProviderKind::Anthropic => rb.header("x-api-key", Self::secret_header(key)?),
+        };
+        Ok(rb.headers(self.extra_headers.clone()))
+    }
+
+    /// Builds the upstream request for a chat completion (translated for
+    /// Anthropic).
+    pub fn build(
+        &self,
+        body: &Value,
+        model: &str,
+        stream: bool,
+        key: &str,
+        auto_cache: bool,
+    ) -> Result<RequestBuilder, ApiError> {
+        let base = self.base();
         let rb = match self.cfg.kind {
             ProviderKind::Openai => {
                 let b = openai::prepare(body, model, stream && self.cfg.stream_usage);
-                self.client.post(format!("{base}/chat/completions")).bearer_auth(key).json(&b)
+                self.client.post(format!("{base}/chat/completions")).json(&b)
             }
             ProviderKind::Azure => {
                 let b = openai::prepare(body, model, stream && self.cfg.stream_usage);
                 // Validated at config load: deployment name and api_version are URL-safe.
                 let version = self.cfg.api_version.as_deref().unwrap_or_default();
-                self.client
-                    .post(format!("{base}/{model}/chat/completions?api-version={version}"))
-                    .header("api-key", Self::secret_header(key)?)
-                    .json(&b)
+                self.client.post(format!("{base}/{model}/chat/completions?api-version={version}")).json(&b)
             }
             ProviderKind::Anthropic => {
-                let b = anthropic::to_request(body, model, stream, self.cfg.default_max_tokens)?;
+                let mut b = anthropic::to_request(body, model, stream, self.cfg.default_max_tokens)?;
+                if auto_cache || self.cfg.auto_prompt_cache {
+                    anthropic::add_cache_markers(&mut b);
+                }
                 self.client
                     .post(format!("{base}/messages"))
-                    .header("x-api-key", Self::secret_header(key)?)
                     .header("anthropic-version", anthropic::API_VERSION)
                     .json(&b)
             }
         };
-        Ok(rb.headers(self.extra_headers.clone()))
+        self.authed(rb, key)
     }
 
-    pub fn supports_embeddings(&self) -> bool {
-        self.cfg.kind != ProviderKind::Anthropic
-    }
-
-    /// Builds an upstream `/embeddings` request (OpenAI-compatible and Azure).
-    pub fn build_embeddings(&self, body: &Value, model: &str) -> Result<RequestBuilder, ApiError> {
-        let base = self.cfg.base_url.trim_end_matches('/');
-        let key = self.cfg.api_key.expose();
+    /// Builds a request for another OpenAI-style JSON endpoint
+    /// (`embeddings`, `responses`, `images/generations`, `moderations`,
+    /// `rerank`, `audio/speech`) with the model replaced.
+    pub fn build_json(
+        &self,
+        path: &str,
+        body: &Value,
+        model: &str,
+        key: &str,
+    ) -> Result<RequestBuilder, ApiError> {
+        let base = self.base();
         let mut b = body.clone();
         if let Some(o) = b.as_object_mut() {
             o.insert("model".into(), Value::String(model.to_string()));
         }
         let rb = match self.cfg.kind {
-            ProviderKind::Openai => self.client.post(format!("{base}/embeddings")).bearer_auth(key).json(&b),
+            ProviderKind::Openai => self.client.post(format!("{base}/{path}")).json(&b),
             ProviderKind::Azure => {
                 let version = self.cfg.api_version.as_deref().unwrap_or_default();
-                self.client
-                    .post(format!("{base}/{model}/embeddings?api-version={version}"))
-                    .header("api-key", Self::secret_header(key)?)
-                    .json(&b)
+                self.client.post(format!("{base}/{model}/{path}?api-version={version}")).json(&b)
             }
             ProviderKind::Anthropic => {
                 return Err(ApiError::bad_request(format!(
-                    "provider '{}' does not support embeddings",
+                    "provider '{}' does not support /{path}",
                     self.name
                 )))
             }
         };
-        Ok(rb.headers(self.extra_headers.clone()))
+        self.authed(rb, key)
+    }
+
+    /// Builds a native Anthropic Messages API request. The client's
+    /// `anthropic-version` and `anthropic-beta` headers are forwarded.
+    pub fn build_messages(
+        &self,
+        body: &Value,
+        model: &str,
+        key: &str,
+        client: &axum::http::HeaderMap,
+        auto_cache: bool,
+    ) -> Result<RequestBuilder, ApiError> {
+        if self.cfg.kind != ProviderKind::Anthropic {
+            return Err(ApiError::bad_request(format!(
+                "provider '{}' does not serve the Messages API",
+                self.name
+            )));
+        }
+        let mut b = body.clone();
+        if let Some(o) = b.as_object_mut() {
+            o.insert("model".into(), Value::String(model.to_string()));
+            if !o.contains_key("max_tokens") {
+                o.insert("max_tokens".into(), json!(self.cfg.default_max_tokens));
+            }
+        }
+        if auto_cache || self.cfg.auto_prompt_cache {
+            anthropic::add_cache_markers(&mut b);
+        }
+        let version = client
+            .get("anthropic-version")
+            .and_then(|v| v.to_str().ok())
+            .filter(|v| v.len() < 64)
+            .unwrap_or(anthropic::API_VERSION)
+            .to_string();
+        let mut rb = self
+            .client
+            .post(format!("{}/messages", self.base()))
+            .header("anthropic-version", version)
+            .json(&b);
+        if let Some(beta) = client.get("anthropic-beta") {
+            rb = rb.header("anthropic-beta", beta.clone());
+        }
+        self.authed(rb, key)
+    }
+
+    /// Builds a raw request to any path of this provider (provider-native
+    /// passthrough). Only safe, content-describing client headers are forwarded.
+    pub fn build_native(
+        &self,
+        method: reqwest::Method,
+        path_and_query: &str,
+        body: axum::body::Bytes,
+        key: &str,
+        client: &axum::http::HeaderMap,
+    ) -> Result<RequestBuilder, ApiError> {
+        let mut url = format!("{}/{}", self.base(), path_and_query.trim_start_matches('/'));
+        if self.cfg.kind == ProviderKind::Azure && !url.contains("api-version=") {
+            let version = self.cfg.api_version.as_deref().unwrap_or_default();
+            url.push(if url.contains('?') { '&' } else { '?' });
+            url.push_str(&format!("api-version={version}"));
+        }
+        let mut rb = self.client.request(method, url).body(body);
+        for h in ["content-type", "accept", "anthropic-beta", "openai-beta"] {
+            if let Some(v) = client.get(h) {
+                rb = rb.header(h, v.clone());
+            }
+        }
+        if self.cfg.kind == ProviderKind::Anthropic {
+            let version = client
+                .get("anthropic-version")
+                .cloned()
+                .unwrap_or(HeaderValue::from_static(anthropic::API_VERSION));
+            rb = rb.header("anthropic-version", version);
+        }
+        self.authed(rb, key)
+    }
+
+    pub fn supports(&self, endpoint: crate::proxy::Endpoint) -> bool {
+        endpoint.supports(self.cfg.kind)
     }
 
     /// Converts a successful non-streaming upstream body to an OpenAI
@@ -134,7 +233,7 @@ impl Provider {
             ProviderKind::Openai | ProviderKind::Azure => {
                 let v: Value = serde_json::from_slice(bytes)
                     .map_err(|_| ApiError::upstream("upstream returned an invalid response"))?;
-                let usage = Usage::from_openai(&v).unwrap_or_default();
+                let usage = Usage::sniff(&v).unwrap_or_default();
                 Ok((bytes.to_vec(), usage))
             }
             ProviderKind::Anthropic => {

@@ -12,7 +12,10 @@ USAGE:
   ai-gateway [serve] [CONFIG]      Run the gateway (default config: $GATEWAY_CONFIG or ./config.yaml)
   ai-gateway check-config [CONFIG] Validate a config file and exit
   ai-gateway generate-key          Print a new random key and its SHA-256 (client keys and admin.token_sha256)
+  ai-gateway generate-encryption-key  Print a value for admin.encryption_key (stored provider keys)
   ai-gateway hash-key              Read a key on stdin and print its SHA-256
+
+Send SIGHUP to reload the config file without restarting.
 ";
 
 fn default_config_path() -> String {
@@ -32,6 +35,10 @@ async fn main() -> anyhow::Result<()> {
             let key = auth::generate_key();
             println!("api_key:    {key}\nkey_sha256: {}", auth::hash_key(&key));
             println!("\nGive api_key to the client. Put only key_sha256 in the config.");
+            return Ok(());
+        }
+        Some("generate-encryption-key") => {
+            println!("{}", ai_gateway::secrets::generate_encryption_key());
             return Ok(());
         }
         Some("hash-key") => {
@@ -66,6 +73,30 @@ async fn main() -> anyhow::Result<()> {
     }
     let metrics = gw_metrics::install()?;
     let state = app::AppState::build(cfg.clone()).await?;
+    *state.config_path.write() = Some(config_path.clone());
+
+    #[cfg(unix)]
+    {
+        let s = state.clone();
+        tokio::spawn(async move {
+            let Ok(mut hup) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) else {
+                return;
+            };
+            while hup.recv().await.is_some() {
+                match s.reload() {
+                    Ok(notes) => {
+                        for n in notes {
+                            tracing::warn!("{n}");
+                        }
+                    }
+                    Err(e) => tracing::error!(
+                        error = format!("{e:#}"),
+                        "config reload failed; keeping the running config"
+                    ),
+                }
+            }
+        });
+    }
 
     {
         let m = metrics.clone();
@@ -135,6 +166,7 @@ async fn main() -> anyhow::Result<()> {
             "exiting with token-usage writes still pending"
         );
     }
+    state.exporter.drain(Duration::from_secs(10)).await;
     tracing::info!("shutdown complete");
     Ok(())
 }

@@ -598,12 +598,13 @@ async fn enforces_daily_token_budget() {
 #[tokio::test]
 async fn streaming_usage_counts_toward_budget() {
     let h = start().await;
-    let stream_body = json!({"model": "anthropic/claude-test", "stream": true, "messages": [{"role": "user", "content": "hi"}]});
-    let _ = h.chat(Some(KEY_BUDGET), stream_body.clone()).await.text().await.unwrap(); // 16 tokens
+    // Distinct prompts: identical streams would be served from the cache.
+    let body = |n: u32| json!({"model": "anthropic/claude-test", "stream": true, "messages": [{"role": "user", "content": format!("hi {n}")}]});
+    let _ = h.chat(Some(KEY_BUDGET), body(1)).await.text().await.unwrap(); // 16 tokens
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let _ = h.chat(Some(KEY_BUDGET), stream_body.clone()).await.text().await.unwrap(); // 32 total
+    let _ = h.chat(Some(KEY_BUDGET), body(2)).await.text().await.unwrap(); // 32 total
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let r = h.chat(Some(KEY_BUDGET), stream_body).await;
+    let r = h.chat(Some(KEY_BUDGET), body(3)).await;
     assert_eq!(r.status(), 429);
 }
 

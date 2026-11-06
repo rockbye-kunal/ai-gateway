@@ -196,6 +196,42 @@ impl Store {
         }
     }
 
+    pub async fn kv_get_many(&self, keys: &[String]) -> Result<Vec<Option<String>>, StoreError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        match self {
+            Store::Memory(m) => Ok(keys.iter().map(|k| m.kv_get(k)).collect()),
+            Store::Redis(r) => r.kv_get_many(keys).await,
+        }
+    }
+
+    /// Deletes a key of any type.
+    pub async fn del(&self, key: &str) -> Result<(), StoreError> {
+        match self {
+            Store::Memory(m) => {
+                m.kv.remove(key);
+                m.lists.remove(key);
+                m.hashes.remove(key);
+                m.counter_hashes.remove(key);
+                m.counters.remove(key);
+                Ok(())
+            }
+            Store::Redis(r) => r.del(key).await,
+        }
+    }
+
+    /// Replaces a list's contents (front first) atomically.
+    pub async fn list_replace(&self, key: &str, items: &[String]) -> Result<(), StoreError> {
+        match self {
+            Store::Memory(m) => {
+                m.lists.insert(key.to_owned(), Mutex::new(items.iter().cloned().collect()));
+                Ok(())
+            }
+            Store::Redis(r) => r.list_replace(key, items).await,
+        }
+    }
+
     /// Adds each `(field, delta)` to a hash of counters and sets its expiry.
     pub async fn hincr_many(
         &self,
@@ -396,6 +432,36 @@ impl RedisStore {
         let key = self.key(key);
         let value: Option<String> = self.bounded_slow(async move { conn.get(key).await }).await?;
         Ok(value)
+    }
+
+    async fn kv_get_many(&self, keys: &[String]) -> Result<Vec<Option<String>>, StoreError> {
+        let mut conn = self.conn.clone();
+        let mut pipe = redis::pipe();
+        for k in keys {
+            pipe.cmd("GET").arg(self.key(k));
+        }
+        let out: Vec<Option<String>> =
+            self.bounded_slow(async move { pipe.query_async(&mut conn).await }).await?;
+        Ok(out)
+    }
+
+    async fn del(&self, key: &str) -> Result<(), StoreError> {
+        let mut conn = self.conn.clone();
+        let key = self.key(key);
+        let _: () = self.bounded_slow(async move { conn.del(key).await }).await?;
+        Ok(())
+    }
+
+    async fn list_replace(&self, key: &str, items: &[String]) -> Result<(), StoreError> {
+        let mut conn = self.conn.clone();
+        let key = self.key(key);
+        let mut pipe = redis::pipe();
+        pipe.atomic().cmd("DEL").arg(&key).ignore();
+        for chunk in items.chunks(1000) {
+            pipe.cmd("RPUSH").arg(&key).arg(chunk).ignore();
+        }
+        let _: () = self.bounded_slow(async move { pipe.query_async(&mut conn).await }).await?;
+        Ok(())
     }
 
     async fn hincr_many(&self, key: &str, fields: &[(String, i64)], ttl_secs: u64) -> Result<(), StoreError> {
