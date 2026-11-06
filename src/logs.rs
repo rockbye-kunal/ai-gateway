@@ -213,6 +213,14 @@ fn stat_fields(e: &LogEntry) -> Vec<(String, i64)> {
         f.push((format!("pe:{p}"), err));
         f.push((format!("pl:{p}"), e.latency_ms as i64));
     }
+    // Every upstream attempt counts toward provider health, including
+    // failures that a fallback later hid from the client.
+    for a in &e.attempts {
+        f.push((format!("pa:{}", a.provider), 1));
+        if a.status >= 400 || a.status == 0 {
+            f.push((format!("pf:{}", a.provider), 1));
+        }
+    }
     if let Some(u) = &e.user {
         let u = clean(u);
         f.push((format!("u:{u}"), 1));
@@ -581,7 +589,7 @@ pub async fn overview(
             ("tokens", "mt"), ("cost_usd", "mc"), ("errors", "me"), ("latency_sum_ms", "ml"),
             ("thumbs_up", "fbu"), ("thumbs_down", "fbd"), ("score_sum", "fbs"), ("score_n", "fbsn"),
         ]),
-        "providers": breakdown("p", &[("errors", "pe"), ("latency_sum_ms", "pl")]),
+        "providers": breakdown("p", &[("errors", "pe"), ("latency_sum_ms", "pl"), ("attempts", "pa"), ("failed_attempts", "pf")]),
         "keys": breakdown("t", &[("tokens", "tt"), ("cost_usd", "tc")]),
         "users": breakdown("u", &[("tokens", "ut"), ("cost_usd", "uc")]),
         "tags": breakdown("g", &[("cost_usd", "gc")]),

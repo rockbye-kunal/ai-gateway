@@ -28,7 +28,9 @@ cache:
 # Create a token with `ai-gateway generate-key`; put only its hash here.
 admin:
   # token_sha256: ${ADMIN_TOKEN_SHA256}
-  key_refresh_secs: 5             # replicas pick up dashboard-created keys this often
+  key_refresh_secs: 5             # replicas pick up dashboard keys, rules and provider keys this often
+  # encryption_key: ${GATEWAY_ENCRYPTION_KEY}   # `ai-gateway generate-encryption-key`; lets the
+                                  # dashboard store provider keys (encrypted) instead of this file
 
 logging:
   enabled: true
@@ -36,6 +38,14 @@ logging:
   capture_bodies: false           # true stores prompts and responses (may contain personal data)
   max_body_bytes: 32768
   detail_ttl_secs: 604800         # 7 days
+  report_retention_days: 90       # hourly usage reports by key, user, tag, model, provider
+  # export:                       # ship every log entry as NDJSON batches ("logpush")
+  #   url: https://logs.example.com/ingest
+  #   headers: {Authorization: "Bearer ${LOG_TOKEN}"}
+  #   include_bodies: false
+  # otlp:                         # one OpenTelemetry trace per request
+  #   endpoint: http://otel-collector:4318
+  #   service_name: ai-gateway
 
 guardrails:
   rules:
@@ -52,6 +62,38 @@ guardrails:
     # - name: injection
     #   builtin: prompt_injection
     #   action: flag
+    # - name: unsafe                # a moderation model; needs an openai-kind provider
+    #   moderation:
+    #     provider: openai
+    #     categories: [violence, hate, self-harm, sexual]
+    #   action: block
+    #   apply_to: request
+
+# Request, token and spend limits. Over a limit: 429 until the window resets.
+limits:
+  - name: per-user-requests
+    kind: requests                # requests | tokens | cost (USD)
+    limit: 120
+    window: minute                # minute | hour | day | week | month (UTC)
+    per: user                     # global | key | user | model | provider | metadata.<name>
+    sliding: true
+  - name: daily-spend-per-key
+    kind: cost
+    limit: 100
+    window: day
+    per: key
+
+# Rewrite or block models before routing. Also editable live in the dashboard.
+routing_rules:
+  - source: openai/gpt-3.5-turbo
+    action: rewrite
+    destination: openai/gpt-4o-mini
+
+# Signed webhook for limit thresholds and provider circuit-breaker trips.
+# alerts:
+#   webhook_url: https://hooks.example.com/ai-gateway
+#   webhook_secret: ${ALERT_SECRET}
+#   thresholds: [0.8, 1.0]
 
 # Every request goes through OpenRouter unless it names a route below.
 # Clients pick any OpenRouter model per request, e.g. "openai/gpt-4o-mini",
@@ -69,6 +111,9 @@ providers:
     max_retries: 2
     breaker_failure_threshold: 5
     breaker_open_secs: 30
+    # zero_data_retention: true   # only if your account has ZDR; ZDR requests go only to such providers
+    # no_prompt_training: true
+    # allow_client_keys: true     # clients may send their own key (providerOptions.gateway.byok)
     # extra_headers:              # optional: identifies your app in OpenRouter analytics
     #   HTTP-Referer: https://your-site.example
     #   X-Title: Your App Name
@@ -84,6 +129,7 @@ providers:
   #   base_url: https://api.anthropic.com/v1
   #   api_key: ${ANTHROPIC_API_KEY}
   #   default_max_tokens: 4096
+  #   auto_prompt_cache: true     # add prompt-caching markers automatically
   # azure:
   #   kind: azure                 # route target `model` is the deployment name
   #   base_url: https://YOUR-RESOURCE.openai.azure.com/openai/deployments
@@ -101,6 +147,13 @@ routes:
         model: openai/gpt-4o-mini
       - provider: openrouter
         model: google/gemini-2.5-flash
+  - name: fast
+    strategy: latency             # fastest first by recent time to first token
+    targets:
+      - provider: openrouter
+        model: google/gemini-2.5-flash
+      - provider: openrouter
+        model: openai/gpt-4o-mini
   - name: smart
     strategy: weighted            # 80/20 A/B split; the other target is still the fallback
     targets:
@@ -121,4 +174,5 @@ keys:
     max_concurrent_requests: 200           # per instance, so one client can't use all capacity
     # Route names, "openrouter/*" (any OpenRouter model), a single model such as
     # "openrouter/anthropic/claude-haiku-4.5", or "*" for everything.
-    allowed_models: ["default", "smart", "openrouter/*"]
+    allowed_models: ["default", "fast", "smart", "openrouter/*"]
+    zero_data_retention: false             # true: never store or cache prompts; ZDR providers only

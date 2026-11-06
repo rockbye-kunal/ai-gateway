@@ -624,13 +624,15 @@ pub fn order_targets(
         RouteStrategy::Cost => out.sort_by(|a, b| price(a).total_cmp(&price(b))),
         RouteStrategy::Latency => {
             if let Some(app) = app {
+                // Targets with no measurement yet go first so they get one.
                 let ttft = |t: &TargetConfig| {
                     app.stats
                         .get(&t.provider, &t.model)
                         .filter(|s| s.ttft_ms > 0.0)
-                        .map_or(f64::MAX, |s| s.ttft_ms)
+                        .map_or(0.0, |s| s.ttft_ms)
                 };
                 out.sort_by(|a, b| ttft(a).total_cmp(&ttft(b)));
+                explore(&mut out);
             }
         }
         RouteStrategy::Weighted => {
@@ -664,6 +666,14 @@ pub fn order_targets(
         }
     }
     out
+}
+
+/// Performance-sorted orders occasionally (5%) try the runner-up first, so
+/// measurements of slower targets stay fresh and a recovered target is noticed.
+fn explore(targets: &mut [TargetConfig]) {
+    if targets.len() > 1 && rand::thread_rng().gen_bool(0.05) {
+        targets.swap(0, 1);
+    }
 }
 
 fn direct_target(provider: &str, model: &str) -> TargetConfig {
@@ -788,13 +798,17 @@ pub fn plan_targets(
             let s = app.stats.get(&t.provider, &t.model);
             match sort {
                 Sort::Cost => price(t),
-                Sort::Latency => s.filter(|s| s.ttft_ms > 0.0).map_or(f64::MAX, |s| s.ttft_ms),
+                // Unmeasured targets first, so they get measured.
+                Sort::Latency => s.filter(|s| s.ttft_ms > 0.0).map_or(0.0, |s| s.ttft_ms),
                 Sort::Throughput => {
-                    s.filter(|s| s.tokens_per_sec > 0.0).map_or(f64::MAX, |s| -s.tokens_per_sec)
+                    s.filter(|s| s.tokens_per_sec > 0.0).map_or(f64::MIN, |s| -s.tokens_per_sec)
                 }
             }
         };
         targets.sort_by(|a, b| metric(a).total_cmp(&metric(b)));
+        if sort != Sort::Cost {
+            explore(&mut targets);
+        }
     }
     let mut seen = std::collections::HashSet::new();
     targets.retain(|t| seen.insert((t.provider.clone(), t.model.clone())));
