@@ -27,7 +27,7 @@ pub enum StoreError {
 #[derive(Clone)]
 pub enum Store {
     Memory(Arc<MemoryStore>),
-    Redis(RedisStore),
+    Redis(Box<RedisStore>),
 }
 
 /// INCRBY with an expiry set only when the key has none, in one round trip.
@@ -91,7 +91,7 @@ impl Store {
                     incr_once: Arc::new(Script::new(INCR_ONCE_LUA)),
                 };
                 store.ping().await.context("redis did not answer PING")?;
-                Ok(Store::Redis(store))
+                Ok(Store::Redis(Box::new(store)))
             }
         }
     }
