@@ -9,7 +9,7 @@
     token: readToken(),
     range: "24h",
     page: "overview",
-    logs: { offset: 0, rows: [], total: 0, live: false, timer: null, filters: { q: "", status: "", tenant: "", model: "" } },
+    logs: { offset: 0, rows: [], total: 0, live: false, timer: null, filters: { q: "", status: "", tenant: "", model: "", user: "", tag: "", endpoint: "" } },
     keys: [],
   };
   const app = document.getElementById("app");
@@ -130,8 +130,12 @@
   const PAGES = [
     ["overview", "Overview"],
     ["logs", "Requests"],
+    ["reports", "Usage reports"],
     ["keys", "API keys"],
+    ["rules", "Routing rules"],
+    ["limits", "Limits"],
     ["setup", "Providers & routes"],
+    ["audit", "Audit log"],
   ];
 
   function shell(content) {
@@ -307,21 +311,33 @@
         fig("Tokens", compact(t.prompt_tokens + t.completion_tokens), compact(t.prompt_tokens) + " in, " + compact(t.completion_tokens) + " out"),
         fig("Spend", usd(t.cost_usd), "Provider-reported or configured prices"),
         fig("Latency p50", ms(t.p50_latency_ms), "p95 " + ms(t.p95_latency_ms) + ", p99 " + ms(t.p99_latency_ms)),
-        fig("Guardrail hits", num(t.guardrail_hits), "Requests with a matched rule")));
+        fig("First token p50", ms(t.p50_ttft_ms), "p95 " + ms(t.p95_ttft_ms)),
+        fig("Guardrail hits", num(t.guardrail_hits), num(t.feedback) + " feedback ratings")));
     requestAnimationFrame(() => drawChart(canvas, series, trafficSeries, { kind: "bars", step: d.step_secs, height: 200 }));
     charts.push(() => drawChart(canvas, series, trafficSeries, { kind: "bars", step: d.step_secs, height: 200 }));
 
     const charts2 = el("div", { class: "grid2" },
       chartPanel("Tokens", d.series, [{ key: "tokens", color: "--tokens", label: "Tokens" }], { kind: "line", step: d.step_secs }),
       chartPanel("Spend", d.series, [{ key: "cost_usd", color: "--cost", label: "Spend" }], { kind: "bars", step: d.step_secs, format: usd }),
-      chartPanel("Average latency", d.series, [{ key: "avg_latency_ms", color: "--traffic", label: "Latency" }], { kind: "line", step: d.step_secs, format: ms }),
+      chartPanel("Latency and time to first token", d.series, [
+        { key: "avg_latency_ms", color: "--traffic", label: "Latency" },
+        { key: "avg_ttft_ms", color: "--tokens", label: "First token" },
+      ], { kind: "line", step: d.step_secs, format: ms }),
       breakdownPanel("Status codes", d.statuses, [], t.requests));
 
+    const models = d.models.map((m) => ({
+      ...m,
+      avg: m.requests ? Math.round(m.latency_sum_ms / m.requests) : 0,
+      rating: (m.thumbs_up || m.thumbs_down) ? Math.round((100 * m.thumbs_up) / (m.thumbs_up + m.thumbs_down)) + "% 👍" : "–",
+    }));
     const tables = el("div", { class: "grid2" },
-      breakdownPanel("Models", d.models, [["Tokens", "tokens", compact], ["Spend", "cost_usd", usd], ["Failed", "errors", num]], t.requests, true),
+      breakdownPanel("Models", models, [["Tokens", "tokens", compact], ["Spend", "cost_usd", usd], ["Failed", "errors", num], ["Avg latency", "avg", ms], ["Feedback", "rating", (x) => x]], t.requests, true),
+      breakdownPanel("Users", d.users, [["Tokens", "tokens", compact], ["Spend", "cost_usd", usd]], t.requests),
+      breakdownPanel("Tags", d.tags, [["Spend", "cost_usd", usd]], t.requests),
+      breakdownPanel("APIs", d.endpoints, [], t.requests),
       breakdownPanel("API keys", d.keys, [["Tokens", "tokens", compact], ["Spend", "cost_usd", usd]], t.requests),
       breakdownPanel("Providers", d.providers.map((p) => ({ ...p, avg: p.requests ? Math.round(p.latency_sum_ms / p.requests) : 0 })),
-        [["Failed", "errors", num], ["Avg latency", "avg", ms]], t.requests));
+        [["Failed", "errors", num], ["Failed attempts", "failed_attempts", (v) => num(v || 0)], ["Avg latency", "avg", ms]], t.requests));
 
     main.replaceChildren(head, strip, charts2, tables);
     if (!t.requests) {
@@ -364,19 +380,26 @@
     const f = state.logs.filters;
     const search = el("input", { type: "search", placeholder: "Search id, error, model, key, guardrail", value: f.q, "aria-label": "Search requests" });
     const status = el("select", { "aria-label": "Status" },
-      [["", "All statuses"], ["ok", "Succeeded"], ["error", "Failed"]].map(([v, l]) =>
+      [["", "All statuses"], ["ok", "Succeeded"], ["error", "Failed"], ["cached", "From cache"], ["flagged", "Guardrail matched"]].map(([v, l]) =>
         el("option", { value: v, selected: f.status === v, text: l })));
     const tenant = el("select", { "aria-label": "API key" }, el("option", { value: "", text: "All keys" }));
     const model = el("input", { type: "text", placeholder: "Model or route", value: f.model, "aria-label": "Model" });
+    const user = el("input", { type: "text", placeholder: "User", value: f.user, "aria-label": "User" });
+    const tag = el("input", { type: "text", placeholder: "Tag", value: f.tag, "aria-label": "Tag" });
+    const endpoint = el("select", { "aria-label": "API" },
+      [["", "All APIs"], ["chat", "Chat"], ["responses", "Responses"], ["messages", "Messages"], ["embeddings", "Embeddings"],
+        ["images", "Images"], ["moderations", "Moderations"], ["rerank", "Rerank"], ["speech", "Speech"], ["native", "Native"], ["realtime", "Realtime"]]
+        .map(([v, l]) => el("option", { value: v, selected: f.endpoint === v, text: l })));
     const live = el("input", { type: "checkbox", checked: state.logs.live });
     const apply = () => {
-      Object.assign(f, { q: search.value, status: status.value, tenant: tenant.value, model: model.value });
+      Object.assign(f, { q: search.value, status: status.value, tenant: tenant.value, model: model.value, user: user.value, tag: tag.value, endpoint: endpoint.value });
       state.logs.offset = 0;
       loadLogs(false);
     };
     let debounce;
     search.addEventListener("input", () => { clearTimeout(debounce); debounce = setTimeout(apply, 250); });
-    model.addEventListener("input", () => { clearTimeout(debounce); debounce = setTimeout(apply, 250); });
+    for (const i of [model, user, tag]) i.addEventListener("input", () => { clearTimeout(debounce); debounce = setTimeout(apply, 250); });
+    endpoint.addEventListener("change", apply);
     status.addEventListener("change", apply);
     tenant.addEventListener("change", apply);
     live.addEventListener("change", () => {
@@ -393,8 +416,10 @@
     const main = shell([
       el("div", { class: "page-head" },
         el("div", {}, el("h1", { text: "Requests" }), el("div", { class: "sub", id: "log-count" })),
-        el("label", { class: "toggle" }, live, "Update every 5 seconds")),
-      el("div", { class: "filters" }, search, status, tenant, model),
+        el("div", { class: "filters" },
+          el("label", { class: "toggle" }, live, "Update every 5 seconds"),
+          el("button", { class: "btn danger", type: "button", text: "Delete matching", onclick: deleteMatching }))),
+      el("div", { class: "filters" }, search, status, tenant, model, user, tag, endpoint),
       tableHost,
     ]);
 
@@ -404,6 +429,19 @@
     }).catch(() => {});
     await loadLogs(false);
     void main;
+  }
+
+  async function deleteMatching() {
+    const f = state.logs.filters;
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(f)) if (v) qs.set(k, v);
+    const filtered = [...qs.keys()].length > 0;
+    if (!confirm(filtered ? "Delete every logged request that matches these filters?" : "Delete every logged request? Analytics and reports are kept.")) return;
+    try {
+      const r = await api("/api/logs" + (filtered ? "?" + qs : ""), { method: "DELETE" });
+      alert("Deleted " + num(r.deleted) + " requests from the log.");
+    } catch (e) { alert(e.message); }
+    loadLogs(false);
   }
 
   async function loadLogs(append, quiet) {
@@ -447,7 +485,8 @@
         el("td", { class: "num", text: ms(r.latency_ms) }),
         el("td", {},
           r.stream ? el("span", { class: "pill", text: "stream" }) : null, " ",
-          r.endpoint === "embeddings" ? el("span", { class: "pill", text: "embed" }) : null, " ",
+          r.endpoint && r.endpoint !== "chat" ? el("span", { class: "pill", text: r.endpoint }) : null, " ",
+          r.attempts_count > 1 ? el("span", { class: "pill flag", text: r.attempts_count + " tries" }) : null, " ",
           (r.guardrails || []).length ? el("span", { class: "pill flag", title: r.guardrails.join(", "), text: "guardrail" }) : null)))));
     const more = state.logs.rows.length < state.logs.total
       ? el("div", { class: "actions" }, el("button", { class: "btn", type: "button", text: "Show more", onclick: () => loadLogs(true) }))
@@ -467,20 +506,44 @@
     const esc = (e) => { if (e.key === "Escape") close(); };
     document.addEventListener("keydown", esc);
     const scrim = el("div", { class: "scrim", onclick: close });
+    const meta = Object.entries(r.metadata || {}).map(([k, v]) => k + "=" + v).join(", ");
     const rows = [
       ["Request id", r.id], ["Time", new Date(r.ts_ms).toLocaleString()], ["API key", r.tenant],
-      ["Endpoint", r.endpoint], ["Requested model", r.route || "–"], ["Served by", (r.provider || "–") + " / " + (r.model || "–")],
-      ["Status", String(r.status)], ["Attempts", String(r.attempts)], ["Streamed", r.stream ? "Yes" : "No"],
+      ["API", r.endpoint], ["Requested model", r.route || "–"], ["Served by", (r.provider || "–") + " / " + (r.model || "–")],
+      ["Status", String(r.status)], ["Streamed", r.stream ? "Yes" : "No"],
       ["Cache", r.cache_hit ? "Served from cache" : "Not cached"],
-      ["Tokens", num(r.prompt_tokens) + " in, " + num(r.completion_tokens) + " out"],
+      ["Tokens", num(r.prompt_tokens) + " in (" + num(r.cached_tokens || 0) + " cached), " + num(r.completion_tokens) + " out" + (r.reasoning_tokens ? " (" + num(r.reasoning_tokens) + " reasoning)" : "")],
       ["Spend", r.cost_usd ? usd(r.cost_usd) : "–"], ["Latency", ms(r.latency_ms)],
+      ["First token", ms(r.ttft_ms)], ["Output speed", r.tokens_per_sec ? r.tokens_per_sec.toFixed(1) + " tokens/s" : "–"],
+      ["User", r.user || "–"], ["Tags", (r.tags || []).join(", ") || "–"], ["Metadata", meta || "–"],
+      ["Event id", r.event_id || "–"],
+      ["Provider key", ({ config: "Config file", stored: "Stored in gateway (BYOK)", request: "Sent by client (BYOK)" })[r.credential] || "–"],
+      ["Zero data retention", r.zero_data_retention ? "Yes" : "No"],
       ["Guardrails", (r.guardrails || []).join(", ") || "None matched"],
       ["Error", r.error || "None"],
     ];
+    const attempts = (r.attempts || []).length ? el("div", { class: "table-wrap" }, el("table", {},
+      el("thead", {}, el("tr", {}, ["#", "Provider / model", "Status", "Started", "Took", "Error"].map((h) => el("th", { text: h })))),
+      el("tbody", {}, r.attempts.map((a, i) => el("tr", {},
+        el("td", { text: String(i + 1) }), el("td", { text: a.provider + " / " + a.model }),
+        el("td", {}, el("span", { class: "pill " + (a.status >= 400 || a.status === 0 ? "err" : "ok"), text: String(a.status) })),
+        el("td", { text: "+" + ms(a.start_ms) }), el("td", { text: ms(a.latency_ms) }), el("td", { class: "trunc", text: a.error || "" }))))))
+      : el("p", { class: "sub", text: r.cache_hit ? "Served from cache; no provider was called." : "No provider attempts recorded." });
+    const fb = r.feedback;
+    const fbStatus = el("span", { class: "sub", text: fb ? "Rated " + (fb.rating > 0 ? "👍" : fb.rating < 0 ? "👎" : "neutral") + (fb.score !== undefined && fb.score !== null ? ", score " + fb.score : "") + (fb.comment ? ": " + fb.comment : "") : "Not rated yet" });
+    const rate = (rating) => async () => {
+      try { await api("/api/logs/" + encodeURIComponent(r.id) + "/feedback", { method: "POST", body: JSON.stringify({ rating }) }); fbStatus.textContent = "Saved " + (rating > 0 ? "👍" : "👎"); }
+      catch (e) { fbStatus.textContent = e.message; }
+    };
     const closeBtn = el("button", { class: "btn", type: "button", text: "Close", onclick: close });
     const drawer = el("aside", { class: "drawer", role: "dialog", "aria-label": "Request detail" },
       el("header", {}, el("div", {}, el("h1", { text: "Request" }), el("div", { class: "sub", text: r.id })), closeBtn),
       el("dl", { class: "kv" }, rows.map(([k, v]) => [el("dt", { text: k }), el("dd", { text: v })])),
+      el("h2", { text: "Provider attempts" }), attempts,
+      el("h2", { text: "Feedback", style: "margin-top:16px" }),
+      el("div", { class: "filters" },
+        el("button", { class: "btn", type: "button", text: "👍 Good", onclick: rate(1) }),
+        el("button", { class: "btn", type: "button", text: "👎 Bad", onclick: rate(-1) }), fbStatus),
       el("h2", { text: "Prompt" }),
       r.request_body ? el("pre", { class: "body", text: prettyBody(r.request_body) })
         : el("p", { class: "sub", text: "Not captured. Turn on logging.capture_bodies to store prompts and responses." }),
@@ -516,7 +579,7 @@
         }
         return el("tr", {},
           el("td", {}, el("div", { text: k.name }), k.key_hint ? el("div", { class: "sub", text: k.key_hint }) : null),
-          el("td", { text: k.source === "admin" ? "Dashboard" : "Config file" }),
+          el("td", {}, k.source === "admin" ? "Dashboard" : "Config file", k.zero_data_retention ? el("span", { class: "pill", style: "margin-left:6px", text: "ZDR" }) : null),
           el("td", { class: "trunc", title: k.allowed_models.join(", "), text: k.allowed_models.join(", ") }),
           el("td", { class: "num", text: k.requests_per_minute ? num(k.requests_per_minute) : "No limit" }),
           el("td", { class: "num" }, usage),
@@ -540,6 +603,7 @@
     const rpm = el("input", { type: "number", min: "1" });
     const budget = el("input", { type: "number", min: "1" });
     const conc = el("input", { type: "number", min: "1" });
+    const zdr = el("input", { type: "checkbox" });
     const err = el("div", { class: "notice err hidden" });
     const close = () => { scrim.remove(); modal.remove(); };
     const scrim = el("div", { class: "scrim", onclick: close });
@@ -553,6 +617,7 @@
           requests_per_minute: optNum(rpm),
           daily_token_budget: optNum(budget),
           max_concurrent_requests: optNum(conc),
+          zero_data_retention: zdr.checked,
         };
         let created;
         try { created = await api("/api/keys", { method: "POST", body: JSON.stringify(body) }); }
@@ -566,7 +631,8 @@
         el("label", { class: "field wide" }, "Allowed models, comma separated (route names, provider/model, provider/* or *)", models),
         el("label", { class: "field" }, "Requests per minute", rpm),
         el("label", { class: "field" }, "Daily token budget", budget),
-        el("label", { class: "field" }, "Concurrent requests per replica", conc)),
+        el("label", { class: "field" }, "Concurrent requests per replica", conc),
+        el("label", { class: "toggle wide" }, zdr, "Zero data retention: never store or cache this key's prompts, and only use ZDR providers")),
       err,
       el("div", { class: "actions" },
         el("button", { class: "btn", type: "button", text: "Cancel", onclick: close }),
@@ -604,12 +670,35 @@
         el("div", { class: "name" }, el("span", { text: p.name }),
           el("span", { class: "pill " + (p.circuit_open ? "err" : "ok"), text: p.circuit_open ? "Circuit open" : "Healthy" })),
         el("div", { class: "meta", text: p.kind + " at " + p.base_url }),
-        el("div", { class: "meta", text: p.timeout_secs + " s timeout, " + p.max_retries + " retries" + (p.embeddings ? ", embeddings" : "") }))));
+        el("div", { class: "meta", text: p.timeout_secs + " s timeout, " + p.max_retries + " retries" }),
+        el("div", { class: "meta", text: "APIs: " + p.endpoints.join(", ") }),
+        el("div", {}, p.zero_data_retention ? el("span", { class: "pill", text: "ZDR" }) : null, " ",
+          p.no_prompt_training ? el("span", { class: "pill", text: "No training" }) : null, " ",
+          p.auto_prompt_cache ? el("span", { class: "pill", text: "Auto prompt cache" }) : null),
+        p.targets.length ? el("table", { class: "mini" },
+          el("tbody", {}, p.targets.slice(0, 6).map((t) => el("tr", {},
+            el("td", { class: "trunc", text: t.target }),
+            el("td", { class: "num", text: t.ttft_ms ? ms(t.ttft_ms) : "–" }),
+            el("td", { class: "num", title: "Output tokens per second", text: t.tokens_per_sec ? Math.round(t.tokens_per_sec) + " t/s" : "–" }),
+            el("td", { class: "num", title: "Success rate", text: Math.round(t.success_rate * 100) + "%" })))))
+          : el("div", { class: "meta", text: "No traffic on this replica yet." }))));
+    let keys = null;
+    try { keys = await api("/api/provider-keys"); } catch (_) {}
+    const byok = keys ? el("section", { class: "panel flush" }, el("h2", { text: "Provider keys" }),
+      el("p", { class: "sub", style: "padding:0 16px", text: keys.storage_enabled ? "Keys stored here are encrypted and replace the config file key on every replica within seconds." : "Set admin.encryption_key to store provider keys here instead of in the config file." }),
+      el("div", { class: "table-wrap" }, el("table", {},
+        el("thead", {}, el("tr", {}, ["Provider", "Key in use", "Clients may bring keys", ""].map((h) => el("th", { text: h })))),
+        el("tbody", {}, keys.data.map((k) => el("tr", {},
+          el("td", { text: k.provider }),
+          el("td", { text: (k.source === "stored" ? "Stored here " : "Config file ") + k.hint }),
+          el("td", { text: k.allow_client_keys ? "Yes" : "No" }),
+          el("td", {}, keys.storage_enabled ? el("button", { class: "btn", type: "button", text: "Replace key", onclick: () => setProviderKey(k.provider) }) : null, " ",
+            k.source === "stored" ? el("button", { class: "btn danger", type: "button", text: "Remove", onclick: () => removeProviderKey(k.provider) }) : null))))))) : null;
     const routes = c.routes.length ? el("table", {},
       el("thead", {}, el("tr", {}, ["Route", "Strategy", "Targets, in fallback order"].map((h) => el("th", { text: h })))),
       el("tbody", {}, c.routes.map((r) => el("tr", {},
         el("td", { text: r.name }),
-        el("td", { text: r.strategy === "weighted" ? "Weighted split" : "First healthy" }),
+        el("td", { text: ({ weighted: "Weighted split", latency: "Fastest first", cost: "Cheapest first", fallback: "First healthy" })[r.strategy] + (r.branches.length ? ", " + r.branches.length + " conditional branch" + (r.branches.length > 1 ? "es" : "") : "") }),
         el("td", { class: "trunc", text: r.targets.map((t) => t.provider + "/" + t.model + (r.strategy === "weighted" ? " (" + (t.weight === null ? 1 : t.weight) + ")" : "")).join("  ›  ") })))))
       : el("div", { class: "empty", text: "No routes. Clients call provider/model directly." });
     const guards = c.guardrails.length ? el("table", {},
@@ -620,8 +709,10 @@
       : el("div", { class: "empty", text: "No guardrail rules. Add them under guardrails.rules in the config." });
     main.replaceChildren(
       el("div", { class: "page-head" }, el("div", {}, el("h1", { text: "Providers & routes" }),
-        el("div", { class: "sub", text: "Version " + c.version + ", " + c.store + " store. Defined in the config file." }))),
+        el("div", { class: "sub", text: "Version " + c.version + ", " + c.store + " store. Defined in the config file." })),
+        c.reloadable ? el("button", { class: "btn", type: "button", text: "Reload config file", onclick: reloadConfig }) : null),
       el("h2", { text: "Providers" }), providers,
+      byok ? el("div", { style: "margin-top:20px" }, byok) : null,
       el("div", { class: "grid2" },
         el("section", { class: "panel flush" }, el("h2", { text: "Routes" }), el("div", { class: "table-wrap" }, routes),
           c.default_provider ? el("p", { class: "sub", style: "padding: 0 16px 12px", text: "Any other model goes to " + c.default_provider + "." }) : null),
@@ -629,7 +720,165 @@
       el("dl", { class: "kv", style: "margin-top: 20px" },
         el("dt", { text: "Response cache" }), el("dd", { text: c.cache.enabled ? "On, " + c.cache.ttl_secs + " s" : "Off" }),
         el("dt", { text: "Request log" }), el("dd", { text: c.logging.enabled ? "Last " + num(c.logging.max_entries) + " requests" : "Off" }),
-        el("dt", { text: "Prompt capture" }), el("dd", { text: c.logging.capture_bodies ? "On" : "Off" })));
+        el("dt", { text: "Prompt capture" }), el("dd", { text: c.logging.capture_bodies ? "On" : "Off" }),
+        el("dt", { text: "Log export" }), el("dd", { text: c.logging.export || "Off" }),
+        el("dt", { text: "OpenTelemetry" }), el("dd", { text: c.logging.otlp || "Off" }),
+        el("dt", { text: "Alerts webhook" }), el("dd", { text: c.alerts ? "On" : "Off" })));
+  }
+
+  async function reloadConfig() {
+    try {
+      const r = await api("/api/reload", { method: "POST" });
+      alert("Config reloaded." + (r.notes.length ? "\n\n" + r.notes.join("\n") : ""));
+    } catch (e) { alert(e.message); }
+    renderSetup();
+  }
+
+  async function setProviderKey(provider) {
+    const key = prompt("New API key for " + provider + ". It is encrypted and never shown again.");
+    if (!key) return;
+    try { await api("/api/provider-keys/" + encodeURIComponent(provider), { method: "PUT", body: JSON.stringify({ api_key: key }) }); }
+    catch (e) { alert(e.message); return; }
+    renderSetup();
+  }
+
+  async function removeProviderKey(provider) {
+    if (!confirm("Remove the stored key for " + provider + "? The key in the config file is used again.")) return;
+    try { await api("/api/provider-keys/" + encodeURIComponent(provider), { method: "DELETE" }); } catch (e) { alert(e.message); return; }
+    renderSetup();
+  }
+
+  // ---------- routing rules ----------
+  async function renderRules() {
+    charts = [];
+    const main = shell(el("div", { class: "empty", text: "Loading…" }));
+    let res;
+    try { res = await api("/api/rules"); } catch (e) { return handleError(e, main); }
+    const source = el("input", { type: "text", placeholder: "openai/gpt-4o or openai/*", required: true });
+    const action = el("select", {}, el("option", { value: "rewrite", text: "Rewrite to" }), el("option", { value: "deny", text: "Deny" }));
+    const dest = el("input", { type: "text", placeholder: "anthropic/claude-haiku-4.5" });
+    const reason = el("input", { type: "text", placeholder: "Reason shown to clients (optional)" });
+    action.addEventListener("change", () => { dest.disabled = action.value === "deny"; });
+    const err = el("div", { class: "notice err hidden" });
+    const form = el("form", {
+      class: "filters",
+      onsubmit: async (e) => {
+        e.preventDefault();
+        const body = { source: source.value.trim(), action: action.value, reason: reason.value.trim() || undefined };
+        if (action.value === "rewrite") body.destination = dest.value.trim();
+        try { await api("/api/rules", { method: "POST", body: JSON.stringify(body) }); renderRules(); }
+        catch (x) { err.textContent = x.message; err.classList.remove("hidden"); }
+      },
+    }, source, action, dest, reason, el("button", { class: "btn primary", type: "submit", text: "Add rule" }));
+    const table = res.data.length ? el("table", {},
+      el("thead", {}, el("tr", {}, ["Model", "Action", "Reason", "Defined in", ""].map((h) => el("th", { text: h })))),
+      el("tbody", {}, res.data.map((r) => el("tr", {},
+        el("td", { text: r.source }),
+        el("td", { text: r.action === "deny" ? "Deny" : "Rewrite to " + r.destination }),
+        el("td", { class: "trunc", text: r.reason || "–" }),
+        el("td", { text: r.origin === "admin" ? "Dashboard" : "Config file" }),
+        el("td", {}, r.origin === "admin" ? [
+          el("button", { class: "btn", type: "button", text: r.enabled ? "Turn off" : "Turn on", onclick: async () => { try { await api("/api/rules/" + r.id, { method: "PATCH", body: JSON.stringify({ enabled: !r.enabled }) }); } catch (e) { alert(e.message); } renderRules(); } }), " ",
+          el("button", { class: "btn danger", type: "button", text: "Delete", onclick: async () => { if (!confirm("Delete this rule?")) return; try { await api("/api/rules/" + r.id, { method: "DELETE" }); } catch (e) { alert(e.message); } renderRules(); } }),
+        ] : null)))))
+      : el("div", { class: "empty", text: "No rules. Requests go to the model they ask for." });
+    main.replaceChildren(
+      el("div", { class: "page-head" }, el("div", {}, el("h1", { text: "Routing rules" }),
+        el("div", { class: "sub", text: "Send requests for one model to another, or block a model. Rules apply to fallbacks too and reach every replica within seconds." }))),
+      form, err, el("section", { class: "panel flush" }, el("div", { class: "table-wrap" }, table)));
+  }
+
+  // ---------- limits ----------
+  async function renderLimits() {
+    charts = [];
+    const main = shell(el("div", { class: "empty", text: "Loading…" }));
+    let res;
+    try { res = await api("/api/limits"); } catch (e) { return handleError(e, main); }
+    const fmtVal = (kind, v) => v === null || v === undefined ? "–" : kind === "cost" ? usd(v) : compact(v);
+    const table = res.data.length ? el("table", {},
+      el("thead", {}, el("tr", {}, ["Limit", "Counts", "Per", "Scope", "Used this " + "window", "Resets"].map((h) => el("th", { text: h })))),
+      el("tbody", {}, res.data.map((l) => {
+        let used = el("span", { text: "Tracked per " + l.per });
+        if (l.used !== null && l.used !== undefined) {
+          const ratio = Math.min(1, l.used / l.limit);
+          const b = el("span");
+          b.style.width = Math.max(2, ratio * 100) + "%";
+          used = el("div", {}, fmtVal(l.kind, l.used) + " of " + fmtVal(l.kind, l.limit), el("div", { class: "bar" + (ratio > 0.8 ? " warn" : "") }, b));
+        }
+        return el("tr", {},
+          el("td", { text: l.name }), el("td", { text: l.kind + " per " + l.window }), el("td", { text: l.per }),
+          el("td", { text: l.scope === "*" ? "Everything" : l.scope || "Each " + l.per }),
+          el("td", {}, used), el("td", { text: new Date(l.resets_at * 1000).toLocaleString() }));
+      })))
+      : el("div", { class: "empty", text: "No limits configured. Add them under limits in the config file." });
+    main.replaceChildren(
+      el("div", { class: "page-head" }, el("div", {}, el("h1", { text: "Limits" }),
+        el("div", { class: "sub", text: "Request, token and spend limits from the config file. Over a limit, requests get 429 until the window resets." }))),
+      el("section", { class: "panel flush" }, el("div", { class: "table-wrap" }, table)));
+  }
+
+  // ---------- reports ----------
+  async function renderReports() {
+    charts = [];
+    const today = new Date().toISOString().slice(0, 10);
+    const monthAgo = new Date(Date.now() - 29 * 86400000).toISOString().slice(0, 10);
+    const start = el("input", { type: "date", value: state.reportStart || monthAgo, "aria-label": "Start date" });
+    const end = el("input", { type: "date", value: state.reportEnd || today, "aria-label": "End date" });
+    const group = el("select", { "aria-label": "Group by" },
+      [["day", "Day"], ["model", "Model"], ["provider", "Provider"], ["key", "API key"], ["user", "User"], ["tag", "Tag"], ["credential_type", "Provider key source"], ["zero_data_retention", "ZDR"]]
+        .map(([v, l]) => el("option", { value: v, selected: (state.reportGroup || "day") === v, text: "By " + l.toLowerCase() })));
+    const host = el("div", {}, el("div", { class: "empty", text: "Loading…" }));
+    let rows = [];
+    const load = async () => {
+      Object.assign(state, { reportStart: start.value, reportEnd: end.value, reportGroup: group.value });
+      const qs = new URLSearchParams({ start_date: start.value, end_date: end.value, group_by: group.value });
+      let res;
+      try { res = await api("/api/report?" + qs); } catch (e) { return handleError(e, host); }
+      rows = res.results;
+      const label = group.value === "key" ? "api_key_name" : group.value;
+      if (!rows.length) { host.replaceChildren(el("div", { class: "panel empty", text: "No usage in this range." })); return; }
+      host.replaceChildren(el("section", { class: "panel flush" }, el("div", { class: "table-wrap" }, el("table", {},
+        el("thead", {}, el("tr", {}, [group.selectedOptions[0].text.replace("By ", ""), "Requests", "Failed", "Input tokens", "Cached", "Output tokens", "Reasoning", "Spend"].map((h, i) => el("th", { class: i ? "num" : null, text: h })))),
+        el("tbody", {}, rows.map((r) => el("tr", {},
+          el("td", { text: r[label] || "(none)" }), el("td", { class: "num", text: num(r.request_count) }), el("td", { class: "num", text: num(r.error_count) }),
+          el("td", { class: "num", text: compact(r.input_tokens) }), el("td", { class: "num", text: compact(r.cached_input_tokens) }),
+          el("td", { class: "num", text: compact(r.output_tokens) }), el("td", { class: "num", text: compact(r.reasoning_tokens) }),
+          el("td", { class: "num", text: usd(r.total_cost) }))))))));
+    };
+    const csv = () => {
+      if (!rows.length) return;
+      const cols = Object.keys(rows[0]);
+      const esc = (v) => '"' + String(v === null || v === undefined ? "" : v).replace(/"/g, '""') + '"';
+      const text = [cols.join(",")].concat(rows.map((r) => cols.map((c) => esc(r[c])).join(","))).join("\n");
+      const a = el("a", { href: URL.createObjectURL(new Blob([text], { type: "text/csv" })), download: "ai-gateway-report-" + start.value + "-to-" + end.value + ".csv" });
+      document.body.append(a); a.click(); a.remove();
+    };
+    for (const i of [start, end, group]) i.addEventListener("change", load);
+    shell([
+      el("div", { class: "page-head" }, el("div", {}, el("h1", { text: "Usage reports" }),
+        el("div", { class: "sub", text: "Spend and tokens by day, model, provider, key, user or tag (UTC dates). Clients can get their own report from GET /v1/report." })),
+        el("div", { class: "filters" }, start, end, group, el("button", { class: "btn", type: "button", text: "Download CSV", onclick: csv }))),
+      host,
+    ]);
+    load();
+  }
+
+  // ---------- audit ----------
+  async function renderAudit() {
+    charts = [];
+    const main = shell(el("div", { class: "empty", text: "Loading…" }));
+    let res;
+    try { res = await api("/api/audit"); } catch (e) { return handleError(e, main); }
+    const table = res.data.length ? el("table", {},
+      el("thead", {}, el("tr", {}, ["Time", "Action", "Target", "Detail"].map((h) => el("th", { text: h })))),
+      el("tbody", {}, res.data.map((a) => el("tr", {},
+        el("td", { text: when(a.ts_ms) }), el("td", { text: a.action }), el("td", { text: a.target }),
+        el("td", { class: "trunc", title: JSON.stringify(a.detail), text: JSON.stringify(a.detail) })))))
+      : el("div", { class: "empty", text: "No admin changes yet." });
+    main.replaceChildren(
+      el("div", { class: "page-head" }, el("div", {}, el("h1", { text: "Audit log" }),
+        el("div", { class: "sub", text: "Changes made through the dashboard or admin API: keys, rules, provider keys, log deletion and reloads." }))),
+      el("section", { class: "panel flush" }, el("div", { class: "table-wrap" }, table)));
   }
 
   // ---------- router ----------
@@ -638,7 +887,7 @@
     const page = (location.hash || "#overview").slice(1);
     state.page = PAGES.some(([id]) => id === page) ? page : "overview";
     if (!state.token) { renderLogin(); return; }
-    ({ overview: renderOverview, logs: renderLogs, keys: renderKeys, setup: renderSetup })[state.page]();
+    ({ overview: renderOverview, logs: renderLogs, reports: renderReports, keys: renderKeys, rules: renderRules, limits: renderLimits, setup: renderSetup, audit: renderAudit })[state.page]();
   }
   window.addEventListener("hashchange", route);
   route();

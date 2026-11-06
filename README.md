@@ -1,41 +1,39 @@
 # ai-gateway
 
-One OpenAI-compatible API in front of OpenAI, Anthropic, Azure OpenAI, Gemini, Groq and any other OpenAI-compatible provider. Clients use the standard OpenAI SDKs and point `base_url` at the gateway. Built in Rust on tokio, axum and reqwest, and designed to run as several replicas behind a load balancer with Redis holding shared state.
+A self-hosted AI gateway in Rust: one place in front of OpenAI, Anthropic, Azure OpenAI, Gemini, Groq, OpenRouter and any OpenAI-compatible provider, with the controls Cloudflare AI Gateway and Vercel AI Gateway offer. Clients keep using the OpenAI or Anthropic SDKs and point their base URL at the gateway. It runs as several replicas behind a load balancer with Redis holding shared state, and ships with a web dashboard.
 
 ## What it does
 
 | Area | Behaviour |
 |---|---|
-| **API** | `POST /v1/chat/completions` (streaming and non-streaming), `POST /v1/embeddings`, `GET /v1/models` |
-| **Providers** | OpenAI-compatible (OpenAI, Gemini, Groq, Together, vLLM…), Azure OpenAI, Anthropic (full translation incl. tools, images, streaming) |
-| **Routing** | Named routes with ordered fallback targets or weighted A/B splits, or direct `provider/model` |
-| **Reliability** | Retries with exponential backoff + jitter, per-provider timeouts, stream idle timeout, circuit breakers, fallback on 5xx / timeouts / 429 / bad upstream credentials |
-| **Security** | Client keys stored as SHA-256 only (with rotation support), provider keys never leave the server or appear in logs, redirects never followed, per-key model allow-lists, authentication before the body is read, body size limit, upstream error details sanitised, tenant-scoped cache |
-| **Limits** | Per-key requests/minute and daily token budgets, shared across replicas via Redis; per-key and per-instance concurrency caps with load shedding |
-| **Caching** | Optional exact-match cache for non-streaming requests, per key, with `x-gateway-cache: skip` bypass |
-| **Observability** | Searchable request log shared by all replicas (optional prompt/response capture), per-minute and per-hour analytics, JSON access log, Prometheus metrics on a separate port |
-| **Dashboard** | Built-in web dashboard and admin API on the admin port: traffic, spend, errors and latency charts, request explorer, API key management, provider health |
-| **Guardrails** | Block, redact or flag emails, card numbers, phone numbers, Aadhaar, PAN, SSNs, IBANs, IPs, secret keys, prompt-injection phrases or your own regex, in prompts and responses |
-| **Operations** | `/healthz`, `/readyz` (fails only while draining), graceful shutdown that lets streams finish and flushes usage writes |
+| **APIs** | OpenAI Chat Completions (streaming), Responses, Embeddings, Images, Moderations, Rerank, Audio speech, Realtime (WebSockets); Anthropic Messages (native); `/native/<provider>/<any path>` passthrough for every other provider endpoint; `/v1/models` |
+| **Providers** | OpenAI-compatible (OpenAI, Gemini, Groq, Together, Mistral, vLLM, Ollama, OpenRouter…), Azure OpenAI, Anthropic (full translation to the OpenAI format, including tools, images and streaming) |
+| **Routing** | Named routes with fallbacks, weighted A/B splits with session affinity, fastest-first and cheapest-first strategies, conditional branches on key, user, tags or metadata, request-level fallback models, provider `order`/`only`/`sort`, model rewrite and deny rules editable live |
+| **Reliability** | Retries with configurable backoff, per-provider and per-request timeouts, stream idle timeout, circuit breakers with alerts, fallback on 5xx / timeouts / 429 / bad credentials |
+| **Limits and spend** | Per-key requests/minute and token budgets; request, token and dollar limits per minute/hour/day/week/month, split by key, user, model, provider or any metadata field; threshold alerts by signed webhook |
+| **Caching** | Exact-match cache for normal and streaming responses, per key, with per-request TTL, skip and custom cache key; automatic Anthropic prompt caching |
+| **Security** | Hashed client keys, keys and routing rules managed live, BYOK (request-scoped or stored encrypted), zero data retention and no-training provider filters, guardrails and DLP (regex detectors and moderation models), audit log |
+| **Observability** | Request log with prompts/responses (optional), every upstream attempt, TTFT, tokens/sec, cached and reasoning tokens, user/tags/metadata, feedback; analytics; usage reports by key, user, tag, model, provider; NDJSON log export; OpenTelemetry traces; Prometheus metrics |
+| **Operations** | Dashboard, admin API, hot config reload (SIGHUP or API), `/healthz`, `/readyz`, graceful shutdown that lets streams finish and flushes usage writes |
 
 ## Quick start
 
 ```bash
 cargo build --release
 
-# 1. Create a client key. Give the key to the client; put only the hash in config.
-./target/release/ai-gateway generate-key
+# 1. Keys. Give api_key to the client; put only key_sha256 in the config.
+./target/release/ai-gateway generate-key           # a client key
+./target/release/ai-gateway generate-key           # the admin token for the dashboard
+./target/release/ai-gateway generate-encryption-key  # optional: lets the dashboard store provider keys
 
 # 2. Configure
-cp config.example.yaml config.yaml          # edit providers, routes, keys
-export OPENAI_API_KEY=... ANTHROPIC_API_KEY=... REDIS_URL=rediss://...
+cp config.example.yaml config.yaml
+export OPENROUTER_API_KEY=... REDIS_URL=rediss://... ADMIN_TOKEN_SHA256=...
 ./target/release/ai-gateway check-config config.yaml
 
 # 3. Run
 ./target/release/ai-gateway serve config.yaml
 ```
-
-Call it with any OpenAI client:
 
 ```python
 from openai import OpenAI
@@ -43,78 +41,147 @@ client = OpenAI(base_url="https://gateway.example.com/v1", api_key="gw_...")
 client.chat.completions.create(model="smart", messages=[{"role": "user", "content": "Hello"}])
 ```
 
-Response headers tell you what happened: `x-request-id`, `x-gateway-provider`, `x-gateway-model`, and `x-gateway-cache: HIT|MISS` when caching is on.
-
-## Using OpenRouter
-
-With `default_provider: openrouter` (as in `config.example.yaml`), every request goes through OpenRouter on your OpenRouter credits, and each request can pick any model it offers:
-
 ```python
-client.chat.completions.create(model="anthropic/claude-haiku-4.5", messages=[...])
-client.chat.completions.create(model="google/gemini-2.5-flash", messages=[...])
-client.chat.completions.create(model="smart", messages=[...])   # a route with fallbacks
+from anthropic import Anthropic
+client = Anthropic(base_url="https://gateway.example.com", api_key="gw_...")
+client.messages.create(model="anthropic/claude-sonnet-4.5", max_tokens=512, messages=[{"role": "user", "content": "Hello"}])
 ```
 
-- A `model` that matches a route name uses that route's targets and fallbacks.
-- A `model` starting with a configured provider name (`openrouter/...`, or `anthropic/...` if you also configured a direct `anthropic` provider) goes to that provider.
-- Anything else is sent to OpenRouter unchanged.
-- Give keys `"openrouter/*"` in `allowed_models` to allow every OpenRouter model, or list specific ones as `"openrouter/anthropic/claude-haiku-4.5"`.
-- OpenRouter-only request fields (such as `models` for OpenRouter-side fallback, or `provider` for provider preferences) are passed through untouched.
-- The actual cost OpenRouter reports for each request is used in the access log and in `gateway_cost_microdollars_total`. No price configuration is needed.
+Response headers: `x-request-id` (also `x-gateway-generation-id`), `x-gateway-provider`, `x-gateway-model`, `x-gateway-cache: HIT|MISS` (also `cf-aig-cache-status`), and `x-gateway-guardrails` when a rule matched.
 
-## Dashboard and admin API
+Open the dashboard at `http://<admin host>:9090/` and sign in with the admin token.
 
-The admin port (`server.admin_listen`) serves a dashboard at `/` and a JSON API under `/api`. Both stay off until you set an admin token:
+## Choosing a model
 
-```bash
-./target/release/ai-gateway generate-key      # use the printed key as the admin token
+`model` can be:
+
+- a **route name** from the config (`smart`), which brings its fallbacks and strategy;
+- `provider/model` for a configured provider (`openai/gpt-4o`, `anthropic/claude-sonnet-4.5`);
+- anything else, sent unchanged to `default_provider` (for example any OpenRouter model).
+
+Keys list what they may use in `allowed_models`: route names, `provider/model`, `provider/*`, or `*`.
+
+## APIs
+
+| Endpoint | Served by |
+|---|---|
+| `POST /v1/chat/completions` | Every provider (Anthropic is translated) |
+| `POST /v1/responses` | OpenAI-compatible providers, streams passed through event by event |
+| `POST /v1/messages` | Anthropic providers, native format, `anthropic-version`/`anthropic-beta` forwarded |
+| `POST /v1/embeddings`, `/v1/images/generations` | OpenAI-compatible and Azure |
+| `POST /v1/moderations`, `/v1/rerank`, `/v1/audio/speech` | OpenAI-compatible |
+| `GET /v1/realtime?model=…` | WebSocket relay to OpenAI-compatible realtime APIs; browsers can authenticate with the `openai-insecure-api-key.<key>` subprotocol |
+| `ANY /native/<provider>/<path>` | Any endpoint of a configured provider, in its own format; the gateway adds the provider key |
+| `GET /v1/models` | Routes this key may use, with prices |
+| `GET /v1/report`, `GET /v1/generation?id=`, `POST /v1/feedback` | The calling key's own usage report, request lookup and feedback |
+
+All of them get authentication, permissions, limits, guardrails, logging and usage tracking. Native passthrough is not cached and only `deny` rules (and same-provider rewrites) apply to it, because its bodies are in each provider's own format.
+
+## Per-request options
+
+Send options as headers (`x-gateway-<name>` or Cloudflare's `cf-aig-<name>`) or in the body under `providerOptions.gateway` (Vercel's shape). `providerOptions` is removed before the request reaches a provider.
+
+| Header | Meaning |
+|---|---|
+| `metadata` | JSON object of strings, numbers or booleans (up to 20 keys), stored in the log and usable in routing and limits |
+| `cache-ttl` / `skip-cache` / `cache-key` | Cache this response for N seconds / bypass the cache / use your own cache key |
+| `collect-log` | `false` keeps the request out of the request log (analytics still count it) |
+| `request-timeout` | Milliseconds for the whole request (capped at the server limit) |
+| `max-attempts`, `retry-delay`, `backoff` | Attempts per target (1-10), first retry delay in ms, `constant`/`linear`/`exponential` |
+| `custom-cost` | `{"per_token_in": .., "per_token_out": ..}` or `{"total_cost": ..}` in USD |
+| `event-id` | Your own id, stored and searchable |
+
+Also `x-session-id` (session affinity), `ai-reporting-user`, `ai-reporting-tags` (comma separated), and W3C `traceparent`. The OpenAI `user` field is the reporting user unless a header sets one.
+
+```json
+"providerOptions": {"gateway": {
+  "order": ["anthropic", "openai"],
+  "only": ["anthropic", "openai"],
+  "models": ["openai/gpt-4o", "google/gemini-2.5-flash"],
+  "sort": "ttft",
+  "user": "user-123",
+  "tags": ["feature:chat", "env:prod"],
+  "metadata": {"plan": "free"},
+  "sessionId": "conversation-42",
+  "caching": "auto",
+  "zeroDataRetention": true,
+  "disallowPromptTraining": true,
+  "byok": {"openai": [{"apiKey": "sk-..."}]}
+}}
 ```
+
+`models` are fallbacks tried after the requested model. `order` puts those providers first; `only` allows nothing else. `sort` is `cost`, `ttft` or `tps` (from recent measurements on this replica). `caching: auto` adds Anthropic prompt-caching markers.
+
+## Routing
 
 ```yaml
-admin:
-  token_sha256: "<key_sha256 from generate-key>"
-  key_refresh_secs: 5
+routes:
+  - name: smart
+    strategy: weighted          # fallback (default) | weighted | latency | cost
+    targets:
+      - provider: anthropic
+        model: claude-sonnet-4.5
+        weight: 90
+        price_input_per_mtok: 3
+        price_output_per_mtok: 15
+      - provider: openai
+        model: gpt-4o
+        weight: 10
+    branches:                   # first match wins; otherwise the targets above
+      - when:
+          metadata.plan: free   # or {in: [...]}, {ne: ..}, {not_in: [...]}, {exists: true}
+        strategy: cost
+        targets:
+          - provider: openai
+            model: gpt-4o-mini
 ```
 
-Open `http://<admin host>:9090/` and sign in with the token. Keep the admin port on a private network; the token is a second lock, not the only one.
+- `weighted` picks the first target by weight; a request with a session id always lands on the same one. Weight 0 makes a target fallback-only.
+- `latency` puts the fastest target first by recent time to first token; `cost` the cheapest by configured price. Untried targets are tried first so they get measured, and 5% of requests try the runner-up to keep measurements fresh.
+- Branch conditions can use `key`, `user`, `tags` and `metadata.<name>`.
 
-| Page | What it shows |
-|---|---|
-| Overview | Requests and failures over time, tokens, spend, cache hit rate, p50/p95/p99 latency, guardrail hits, and breakdowns by model, API key, provider and status code. Ranges from 15 minutes to 30 days. |
-| Requests | Every request, filterable by status, key, model and free text. Click one for its full detail, plus prompt and response when capture is on. Can refresh every 5 seconds. |
-| API keys | Config and dashboard keys, their limits, and tokens used today against the budget. Create keys (shown once) and revoke them without a restart. |
-| Providers & routes | Circuit-breaker state per provider, routes and weights, guardrail rules. |
-
-The same data is available to scripts:
-
-| Method and path | Purpose |
-|---|---|
-| `GET /api/overview?range=24h` | Totals, time series and breakdowns (`15m` to `35d`) |
-| `GET /api/logs?status=error&tenant=acme&model=gpt&q=timeout&limit=100&offset=0` | Request log, newest first |
-| `GET /api/logs/{request_id}` | One request, with prompt and response when captured |
-| `GET /api/keys`, `POST /api/keys`, `DELETE /api/keys/{name}` | List, create and revoke API keys |
-| `GET /api/config` | Providers, circuit state, routes and guardrails |
-
-```bash
-curl -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -d '{"name":"mobile-app","allowed_models":["smart"],"requests_per_minute":300,"daily_token_budget":5000000}' \
-  http://127.0.0.1:9090/api/keys
-```
-
-Keys created this way are stored (hash only) in Redis and picked up by every replica within `admin.key_refresh_secs`, so a revoked key stops working everywhere within that time. With the memory store they last until the process restarts. Keys in the config file can't be changed from the API, and their names are reserved.
-
-### Request log and analytics
+Routing rules rewrite or deny models before routing, and apply to fallbacks too. Put them in the config or manage them live from the dashboard (`/api/rules`):
 
 ```yaml
-logging:
-  enabled: true
-  max_entries: 10000         # most recent requests kept in the searchable log
-  capture_bodies: false      # store prompts and responses (they may hold personal data)
-  max_body_bytes: 32768      # longer prompts and responses are truncated
-  detail_ttl_secs: 604800    # full detail kept 7 days
+routing_rules:
+  - source: openai/gpt-3.5-turbo   # a model, provider/* or *
+    action: rewrite
+    destination: openai/gpt-4o-mini
+  - source: openai/o1-preview
+    action: deny
+    reason: retired model           # shown to clients in the 403
 ```
 
-Each finished request is written after the response is sent, so a slow store never delays clients. Analytics are counters in per-minute buckets (kept 2 days) and per-hour buckets (kept 35 days). Unauthenticated requests are counted in metrics but not logged, so junk traffic can't push real entries out of the log. Guardrail redactions happen before capture, so redacted text never reaches the log.
+## Limits, budgets and alerts
+
+```yaml
+limits:
+  - name: per-user-requests
+    kind: requests                # requests | tokens | cost (USD)
+    limit: 60
+    window: minute                # minute | hour | day | week | month (UTC)
+    per: user                     # global | key | user | model | provider | metadata.<name>
+    sliding: true                 # requests only: smooth the window edge
+  - name: monthly-spend-per-key
+    kind: cost
+    limit: 500
+    window: month
+    per: key
+    keys: [acme-prod]             # optional filter
+    models: ["openai/*"]          # optional filter
+alerts:
+  webhook_url: https://hooks.example.com/ai-gateway
+  webhook_secret: ${ALERT_SECRET}   # HMAC-SHA256 of the body in x-gateway-signature
+  thresholds: [0.8, 1.0]
+```
+
+Over a limit, requests get `429` with code `limit_exceeded` and `Retry-After` until the window resets. Token and cost limits are charged when a request finishes, so concurrent requests can overshoot slightly (the same soft cap as Cloudflare and Vercel). A `per: provider` limit skips that provider and falls back instead of failing. Alerts fire once per limit, window and threshold across all replicas; the webhook also receives `provider.circuit_open` events. Per-key `requests_per_minute` and `daily_token_budget` still work as before.
+
+## Keys, provider keys (BYOK) and data handling
+
+- **Client keys** come from the config file or the dashboard. Dashboard keys are stored as hashes in Redis and reach every replica within `admin.key_refresh_secs`.
+- **Provider keys** come from the config file, from the dashboard (encrypted with AES-256-GCM using `admin.encryption_key`, stored in Redis), or per request in `providerOptions.gateway.byok`. A wrong client-supplied key returns `401 provider_key_rejected`; a wrong gateway key falls back to the next target. Set `allow_client_keys: false` on a provider to refuse request keys. The log records which kind was used (`config`, `stored`, `request`).
+- **Zero data retention**: mark providers with `zero_data_retention: true` (and `no_prompt_training: true`). A key with `zero_data_retention: true`, or a request with `zeroDataRetention`, only goes to those providers, is never cached, and its prompts and responses are never logged or exported. `disallowPromptTraining` filters on `no_prompt_training`.
 
 ## Guardrails
 
@@ -122,124 +189,132 @@ Each finished request is written after the response is sent, so a slow store nev
 guardrails:
   rules:
     - name: no-cards
-      builtin: credit_card     # Luhn-checked, so order numbers don't trip it
+      builtin: credit_card     # Luhn-checked
       action: block            # block | redact | flag
       apply_to: request        # request | response | both (default)
     - name: emails
       builtin: email
       action: redact           # replaced with [REDACTED:emails]
-    - name: secrets
-      builtin: api_key
-      action: redact
     - name: injection
       builtin: prompt_injection
-      action: flag             # passes through, recorded in the log
-    - name: project-codename
+      action: flag
+    - name: violence
+      moderation:              # a moderation model, like Llama Guard categories
+        provider: openai       # an openai-kind provider with /moderations
+        model: omni-moderation-latest
+        categories: [violence, hate, self-harm]   # empty = any flagged category
+        threshold: 0.8         # optional; default is the model's own decision
+        fail_open: true
+      action: block
+    - name: codename
       pattern: "(?i)project\\s+falcon"
       action: block
 ```
 
-Built-in detectors: `email`, `credit_card`, `phone_in`, `phone_intl`, `aadhaar`, `pan`, `us_ssn`, `iban`, `ipv4`, `api_key` (OpenAI, Anthropic, AWS, GitHub, Google, Slack and gateway keys) and `prompt_injection` (a phrase heuristic; use it with `flag`). Rules check message text, text parts and embeddings `input`. A blocked request gets `400` with code `content_blocked` and never reaches a provider. Response rules run on non-streaming chat responses; streamed responses are not checked. Matches are counted in `gateway_guardrail_hits_total{rule,stage}`.
+Built-in detectors: `email`, `credit_card`, `phone_in`, `phone_intl`, `aadhaar`, `pan`, `us_ssn`, `iban`, `ipv4`, `api_key`, `prompt_injection`. Rules see chat and Messages turns and system prompts, Responses/embeddings/moderation `input`, image `prompt` and rerank `query`/`documents`. Blocked requests get `400 content_blocked` and never reach a provider. Response rules run on non-streaming responses. Matches appear in `x-gateway-guardrails`, the log and `gateway_guardrail_hits_total`.
 
-## Weighted routes
+## Caching
 
 ```yaml
-routes:
-  - name: smart
-    strategy: weighted         # default is fallback
-    targets:
-      - provider: openrouter
-        model: anthropic/claude-sonnet-4.5
-        weight: 90
-      - provider: openrouter
-        model: openai/gpt-4o
-        weight: 10
-      - provider: openai
-        model: gpt-4o-mini
-        weight: 0              # never picked first, still a fallback
+cache:
+  enabled: true
+  ttl_secs: 300
 ```
 
-Each request picks its first target by weight; the other targets stay fallbacks in the order listed. Use it for A/B tests, gradual model rollouts or spreading load across accounts. The dashboard shows each model's traffic, errors and spend side by side.
+Identical requests from the same key, routed to the same targets, are served from the cache, including streams (replayed as the same SSE). Use the `cache-ttl`, `skip-cache` and `cache-key` headers per request. Images and speech are not cached. Anthropic prompt caching is separate: set `auto_prompt_cache: true` on the provider or send `caching: auto`, and cached input tokens show up in the log and reports.
 
-## Embeddings
+## Dashboard and admin API
 
-`POST /v1/embeddings` takes the standard OpenAI body and goes through the same keys, permissions, limits, budgets, cache, retries and fallbacks as chat. It works with OpenAI-compatible and Azure providers; Anthropic targets are skipped because Anthropic has no embeddings API.
+The admin port serves the dashboard at `/` and a JSON API under `/api`, both protected by the admin token (`admin.token_sha256`). Pages: Overview (traffic, failures, tokens, spend, latency and time to first token, breakdowns by model with feedback, user, tag, API, key, provider including failed attempts), Requests (search, filters, full detail with every provider attempt, prompts and responses, feedback buttons, delete), Usage reports (by day, model, provider, key, user, tag, credential, ZDR; CSV download), API keys, Routing rules, Limits, Providers & routes (health, live latency and throughput per model, stored provider keys, reload), Audit log.
+
+| Admin API | Purpose |
+|---|---|
+| `GET /api/overview?range=24h` | Totals, time series, breakdowns |
+| `GET /api/logs?status=&tenant=&model=&user=&tag=&endpoint=&metadata=k%3Dv&q=` / `DELETE` with the same filters | Search or delete logged requests |
+| `GET /api/logs/{id}`, `POST /api/logs/{id}/feedback` | One request; rate it (`rating` 1/0/-1, `score` 0-100, `comment`) |
+| `GET /api/report?start_date=&end_date=&group_by=` | Usage report (same fields as Vercel's reporting API) |
+| `GET/POST /api/keys`, `DELETE /api/keys/{name}` | Client keys |
+| `GET/POST /api/rules`, `PATCH/DELETE /api/rules/{id}` | Routing rules |
+| `GET /api/provider-keys`, `PUT/DELETE /api/provider-keys/{provider}` | Stored provider keys |
+| `GET /api/limits`, `GET /api/audit`, `GET /api/config`, `POST /api/reload` | Limit usage, audit log, configuration and health, reload |
+
+## Logs, export and tracing
+
+```yaml
+logging:
+  enabled: true
+  max_entries: 10000          # searchable log size
+  capture_bodies: false       # prompts and responses
+  detail_ttl_secs: 604800
+  report_retention_days: 90
+  export:                     # NDJSON batches of log entries ("logpush")
+    url: https://logs.example.com/ingest
+    headers: {Authorization: "Bearer ${LOG_TOKEN}"}
+    include_bodies: false
+  otlp:                       # one trace per request, a span per provider attempt
+    endpoint: http://otel-collector:4318
+    service_name: ai-gateway
+```
+
+Each request records the key, user, tags, metadata, model and provider, status, every upstream attempt, prompt/completion/cached/reasoning tokens, cost, latency, time to first token, tokens per second, guardrail matches and feedback. Exports and traces go through bounded queues and are dropped (and counted) rather than slowing requests down. OpenTelemetry spans use the `gen_ai.*` conventions and continue the client's `traceparent`.
+
+## Reloading configuration
+
+Send `SIGHUP` or call `POST /api/reload` to re-read the config file. Providers, routes, guardrails, limits, routing rules, config keys, cache and logging options change immediately; circuit-breaker state and per-key concurrency carry over when a provider or key is unchanged. Listen addresses, the store, the admin token and log export endpoints need a restart. A config that fails validation is rejected and the running one stays.
 
 ## How a request flows
 
-1. **Authenticate** — `Authorization: Bearer <key>` or `x-api-key`. The key is hashed and looked up.
-2. **Validate** — JSON object, `model`, non-empty `messages`, body under `max_body_bytes`.
-3. **Resolve** — `model` is a route name, `provider/model`, or (with `default_provider` set) any other model name, passed to the default provider; the key's `allowed_models` must permit it.
-4. **Limit** — requests/minute (fixed one-minute window) and daily token budget (UTC day), in Redis.
-5. **Guardrails** — request rules block, redact or flag; redaction happens before caching, logging and the upstream call.
-6. **Cache** — non-streaming requests are looked up by a hash of key name + full request body.
-7. **Call upstream** — for each target in order: retry up to `max_retries` with backoff; skip a provider whose circuit is open.
-   - 400/404/413/422 → returned to the client as-is (another provider would reject it too)
-   - 401/403 → logged as a gateway config problem, next target tried, client sees a generic 502
-   - 429, 5xx, timeouts, connection errors → retried, then next target
-8. **Respond** — Response guardrails run on non-streaming chat responses. Anthropic responses and streams are translated to OpenAI format. Token usage is recorded when the response or stream ends. If a stream ends before the provider reports usage (the client disconnected, or the stream broke), the gateway bills an estimate: the provider's numbers where it has them, otherwise about four characters per token of what was sent and received.
-
-The whole request, including retries and fallbacks, must produce response headers within `server.request_timeout_secs`, or the client gets a 504 in the OpenAI error format.
+1. **Authenticate** the key and claim its concurrency slot, before reading the body.
+2. **Options** from headers and `providerOptions.gateway`, which is stripped.
+3. **Validate** the body for the API.
+4. **Routing rules**, then **targets**: route branches and strategy, fallback models, `only`, `order`, `sort`, ZDR and training filters, the API's supported providers.
+5. **Limits**: key rate and budget, then configured limits.
+6. **Guardrails**: regex rules (block, redact, flag), then moderation models.
+7. **Cache** lookup.
+8. **Upstream**: for each target, per-provider limits, circuit breaker, credentials (request, stored or config key), retries with backoff, fallback on failure.
+9. **Respond**: translate or pass through, response guardrails, cache, then (after the response) log, usage, limits, alerts and export.
 
 ## Running behind a load balancer
 
-- Use `store.backend: redis`. Rate limits, budgets and the cache are then shared by every replica. Use `rediss://` for TLS to managed Redis.
+- Use `store.backend: redis`. Limits, budgets, cache, logs, keys, rules and stored provider keys are then shared by every replica. Use `rediss://` for TLS to managed Redis.
 - Terminate TLS at the load balancer. The gateway listens on plain HTTP inside your network.
-- Point the load balancer health check at `GET /readyz` on the API port. It does not check Redis on purpose: if it did, a Redis outage would mark every replica unhealthy at once. Watch `gateway_store_errors_total` for Redis health instead.
-- Redis must be reachable when an instance starts. After that, a Redis outage is handled per request by `store.on_error`.
-- On SIGTERM the gateway fails `/readyz` for `shutdown_drain_secs`, then stops accepting connections, then gives in-flight requests up to `shutdown_grace_secs`. Set your orchestrator's termination grace period above the sum (Kubernetes `terminationGracePeriodSeconds`).
-- Disable response buffering and set a long read timeout on the load balancer for SSE (see `deploy/nginx.conf`).
-- Keep `admin_listen` (metrics) on a private network.
-- Circuit breakers are per replica on purpose: no coordination needed, and each instance reacts to what it sees.
+- Point the health check at `GET /readyz` on the API port. It does not check Redis on purpose: a Redis outage would otherwise mark every replica unhealthy at once. Watch `gateway_store_errors_total` instead.
+- On SIGTERM the gateway fails `/readyz` for `shutdown_drain_secs`, stops accepting connections, gives in-flight requests up to `shutdown_grace_secs`, then flushes usage writes and log exports.
+- Disable response buffering and set a long read timeout on the load balancer for SSE and WebSockets (see `deploy/nginx.conf`).
+- Keep `admin_listen` on a private network.
+- Circuit breakers and latency measurements are per replica on purpose.
 
 `docker compose up --build` runs two replicas, Redis and nginx locally in that shape.
 
 ## Choosing fail-open or fail-closed
 
-`store.on_error` decides what happens when Redis is unreachable:
-
-- `closed` (default): requests from keys with a rate limit or budget get 503. Keys with no limits keep working. Protects spend.
-- `open`: requests go through without rate limits or budgets. Protects availability.
-
-The cache always fails open.
-
-## Configuration reference
-
-See `config.example.yaml` for every option with comments. Strings may use `${ENV_VAR}` or `${ENV_VAR:-default}`; substitution happens after parsing, so secrets can't break the YAML.
-
-Key provider settings: `timeout_secs` (headers, and the whole body when not streaming), `stream_idle_timeout_secs` (max gap between stream chunks), `max_retries`, `breaker_failure_threshold`, `breaker_open_secs`, `extra_headers`. Plain `http://` base URLs are rejected unless the host is loopback or `allow_insecure_http: true` is set.
+`store.on_error` decides what happens when Redis is unreachable: `closed` (default) rejects requests that need a limit or budget check with 503; `open` lets them through without limits. The cache always fails open.
 
 ## Rotating a client key
 
-Generate a new key, set its hash as `key_sha256`, and move the old hash into `previous_key_sha256`. Roll the config out, let the client switch, then remove the old hash. Both keys share the tenant's limits, budget and metrics during the overlap.
+Generate a new key, set its hash as `key_sha256`, and move the old hash into `previous_key_sha256`. Reload, let the client switch, then remove the old hash. Both keys share the tenant's limits, budget and metrics during the overlap. Dashboard keys are rotated by creating a new key and revoking the old one.
 
 ## Metrics
 
-On `admin_listen` at `/metrics`:
-
-`gateway_requests_total`, `gateway_request_duration_seconds`, `gateway_tokens_total`, `gateway_cost_microdollars_total`, `gateway_upstream_errors_total`, `gateway_upstream_skipped_total`, `gateway_circuit_open`, `gateway_rejected_total`, `gateway_cache_total`, `gateway_store_errors_total`, `gateway_guardrail_hits_total`.
-
-Good first alerts: `gateway_circuit_open == 1`, a rising `gateway_store_errors_total`, `gateway_rejected_total{reason="overloaded"}`, and p95 of `gateway_request_duration_seconds`.
+On `admin_listen` at `/metrics`: `gateway_requests_total`, `gateway_request_duration_seconds`, `gateway_time_to_first_token_seconds`, `gateway_tokens_total`, `gateway_cost_microdollars_total`, `gateway_upstream_errors_total`, `gateway_upstream_skipped_total`, `gateway_circuit_open`, `gateway_rejected_total{reason}`, `gateway_cache_total`, `gateway_store_errors_total`, `gateway_guardrail_hits_total`, `gateway_guardrail_errors_total`, `gateway_alerts_total`, `gateway_export_batches_total`, `gateway_export_dropped_total`, `gateway_config_reloads_total`.
 
 ## Testing
 
 ```bash
-cargo test
+cargo test                                                        # in-memory store
+AIGW_TEST_REDIS_URL=redis://127.0.0.1:6379/0 cargo test           # against real Redis
 ```
 
-Commit `Cargo.lock` after the first build, so CI and Docker builds use exactly the dependency versions you tested.
+`tests/e2e.rs` and `tests/parity.rs` run a real gateway in front of mock OpenAI, Anthropic, moderation, image, speech, rerank and realtime WebSocket servers, plus webhook, log-export and OTLP collectors, covering every feature above.
 
-Unit tests cover config validation, auth, the circuit breaker, SSE parsing and Anthropic translation. `tests/e2e.rs` starts a real gateway in front of mock OpenAI and Anthropic servers and checks auth, validation, permissions, retries, fallback, circuit breaking, credential fallback, client-error passthrough, OpenAI and Anthropic streaming, tool calls, caching, rate limits and token budgets.
+## How it compares
 
-## Known limits
+Matches Cloudflare AI Gateway and Vercel AI Gateway on: unified OpenAI API, Responses and Anthropic Messages APIs, provider-native endpoints, realtime WebSockets, caching with per-request controls, rate and spend limits with alerts, dynamic and conditional routing, fallbacks and retries, provider ordering and filtering, routing rules, BYOK, ZDR, guardrails and DLP, request logs with metadata and feedback, usage reporting, generation lookup, log export, OpenTelemetry, analytics and a dashboard.
 
-- Token budgets are checked before a request and charged after it, so concurrent requests can overshoot a budget by the size of the requests in flight. `max_concurrent_requests` on the key bounds this.
-- When a timeout fires after the provider has already started work, that attempt is retried. The abandoned attempt may still cost provider tokens that the gateway never sees, so it is not charged to the tenant.
-- Rate-limit and budget windows use each instance's clock. Keep replicas on NTP.
-- Anthropic targets ignore `response_format`. Ask for JSON in the prompt, or route JSON-mode traffic to OpenAI-compatible providers.
-- The rate limit is a fixed one-minute window, so a key can burst up to twice its limit across a window boundary.
-- Implemented: `/v1/chat/completions`, `/v1/embeddings` and `/v1/models`. Images, audio, the Responses API and Anthropic's Messages API as an inbound format are not.
-- Response guardrails don't check streamed responses.
-- The response cache is exact-match only; there is no semantic (similar-prompt) cache.
-- Log search scans the most recent `logging.max_entries` requests. For long-term retention, ship the JSON access log to your log platform.
-- API keys can be created and revoked live from the dashboard. Other config changes (providers, routes, guardrails) need a rolling restart.
+Not included:
+
+- **Unified billing** (one invoice for every provider): it needs a billing relationship with each provider, which a self-hosted gateway doesn't have. Use your own provider accounts.
+- **Semantic caching**: the cache is exact-match.
+- **Automated evaluations and log classification** with an LLM judge; human feedback and per-model comparisons are included.
+- **Translating** the Messages API to non-Anthropic models or the Responses API to non-OpenAI models; each goes to providers that speak it natively.
+- Response guardrails on streamed responses, multipart uploads (image edits, transcription) through the unified API (use `/native/...`), and video generation.
