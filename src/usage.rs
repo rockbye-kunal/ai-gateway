@@ -67,12 +67,20 @@ pub struct RequestState {
     pub price_output_per_mtok: Option<f64>,
     /// Per-tenant concurrency slot, released when the request finishes.
     pub tenant_permit: Option<OwnedSemaphorePermit>,
+    /// `chat` or `embeddings`.
+    pub endpoint: &'static str,
+    /// Guardrail rules that matched.
+    pub guardrails: Vec<String>,
+    /// Captured only when `logging.capture_bodies` is on.
+    pub request_body: Option<String>,
+    pub response_body: Option<String>,
 }
 
 struct Inner {
     app: Arc<AppState>,
     request_id: String,
     start: Instant,
+    start_ms: u64,
     state: Mutex<RequestState>,
     // Held for the whole request, including the streaming body, so the
     // concurrency limit counts long streams correctly.
@@ -88,6 +96,7 @@ impl RequestGuard {
             app,
             request_id,
             start: Instant::now(),
+            start_ms: crate::proxy::unix_millis(),
             state: Mutex::new(RequestState::default()),
             _permit: permit,
         }))
@@ -99,6 +108,57 @@ impl RequestGuard {
 
     pub fn update(&self, f: impl FnOnce(&mut RequestState)) {
         f(&mut self.0.state.lock());
+    }
+
+    /// Whether prompts and responses are being captured for the log.
+    pub fn capturing(&self) -> bool {
+        let l = &self.0.app.cfg.logging;
+        l.enabled && l.capture_bodies
+    }
+
+    /// Stores text for the log, truncated to `logging.max_body_bytes`.
+    pub fn capture_request(&self, text: &str) {
+        if self.capturing() {
+            let t = crate::logs::truncate_utf8(text, self.0.app.cfg.logging.max_body_bytes);
+            self.update(|s| s.request_body = Some(t));
+        }
+    }
+
+    pub fn capture_response(&self, text: &str) {
+        if self.capturing() {
+            let t = crate::logs::truncate_utf8(text, self.0.app.cfg.logging.max_body_bytes);
+            self.update(|s| s.response_body = Some(t));
+        }
+    }
+
+    /// Appends the generated text of one OpenAI-format stream chunk.
+    pub fn capture_stream_chunk(&self, payload: &str) {
+        if !self.capturing() {
+            return;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(payload) else { return };
+        let Some(choices) = v.get("choices").and_then(Value::as_array) else { return };
+        let max = self.0.app.cfg.logging.max_body_bytes;
+        let mut st = self.0.state.lock();
+        let buf = st.response_body.get_or_insert_with(String::new);
+        for c in choices {
+            let d = &c["delta"];
+            let mut push = |t: &str| {
+                if buf.len() < max {
+                    buf.push_str(&crate::logs::truncate_utf8(t, max - buf.len()));
+                }
+            };
+            if let Some(t) = d.get("content").and_then(Value::as_str) {
+                push(t);
+            }
+            if let Some(calls) = d.get("tool_calls").and_then(Value::as_array) {
+                for call in calls {
+                    if let Some(t) = call["function"].get("arguments").and_then(Value::as_str) {
+                        push(t);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -172,6 +232,38 @@ impl Drop for Inner {
             error = st.error.as_deref().unwrap_or(""),
             "request completed"
         );
+
+        if self.app.cfg.logging.enabled {
+            if let (Some(t), Ok(handle)) = (&st.tenant, tokio::runtime::Handle::try_current()) {
+                let entry = crate::logs::LogEntry {
+                    id: self.request_id.clone(),
+                    ts_ms: self.start_ms,
+                    tenant: t.name.clone(),
+                    endpoint: if st.endpoint.is_empty() { "chat".into() } else { st.endpoint.into() },
+                    route: st.route.clone(),
+                    provider: st.provider.clone(),
+                    model: st.model.clone(),
+                    status: st.status,
+                    stream: st.stream,
+                    cache_hit: st.cache_hit,
+                    attempts: st.attempts,
+                    prompt_tokens: if st.cache_hit { 0 } else { st.usage.prompt_tokens },
+                    completion_tokens: if st.cache_hit { 0 } else { st.usage.completion_tokens },
+                    cost_usd,
+                    latency_ms: (latency * 1000.0) as u64,
+                    error: st.error.clone(),
+                    guardrails: st.guardrails.clone(),
+                    request_body: st.request_body.clone(),
+                    response_body: st.response_body.clone(),
+                };
+                let app = self.app.clone();
+                app.pending_usage_writes.fetch_add(1, Ordering::SeqCst);
+                handle.spawn(async move {
+                    crate::logs::record(&app, entry).await;
+                    app.pending_usage_writes.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+        }
 
         if billable {
             if let Some(t) = &st.tenant {

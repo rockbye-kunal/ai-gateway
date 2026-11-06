@@ -14,7 +14,7 @@ use axum::{
     extract::{DefaultBodyLimit, State},
     http::{header, HeaderValue, StatusCode},
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use metrics_exporter_prometheus::PrometheusHandle;
@@ -22,8 +22,10 @@ use tokio::sync::{watch, Semaphore};
 use tower_http::{catch_panic::CatchPanicLayer, set_header::SetResponseHeaderLayer};
 
 use crate::{
+    admin,
     auth::KeyRing,
-    config::{Config, TargetConfig},
+    config::{Config, RouteConfig},
+    guardrails::Guardrails,
     providers::Provider,
     proxy,
     store::Store,
@@ -33,7 +35,8 @@ pub struct AppState {
     pub cfg: Config,
     pub keys: KeyRing,
     pub providers: HashMap<String, Arc<Provider>>,
-    pub routes: HashMap<String, Vec<TargetConfig>>,
+    pub routes: HashMap<String, RouteConfig>,
+    pub guardrails: Guardrails,
     pub store: Store,
     pub limiter: Arc<Semaphore>,
     /// False while draining for shutdown, so the load balancer stops routing here.
@@ -64,11 +67,13 @@ impl AppState {
         for (name, p) in &cfg.providers {
             providers.insert(name.clone(), Arc::new(Provider::new(name, p.clone(), client.clone())?));
         }
-        let routes = cfg.routes.iter().map(|r| (r.name.clone(), r.targets.clone())).collect();
+        let routes = cfg.routes.iter().map(|r| (r.name.clone(), r.clone())).collect();
+        let guardrails = Guardrails::compile(&cfg.guardrails)?;
         let store = Store::connect(&cfg.store).await?;
 
-        Ok(Arc::new(Self {
+        let state = Arc::new(Self {
             keys: KeyRing::new(&cfg.keys),
+            guardrails,
             limiter: Arc::new(Semaphore::new(cfg.server.max_concurrent_requests)),
             providers,
             routes,
@@ -77,7 +82,29 @@ impl AppState {
             pending_usage_writes: AtomicUsize::new(0),
             stream_cancel: watch::channel(false).0,
             cfg,
-        }))
+        });
+
+        // Keys created through the admin API live in the store. Load them now
+        // and keep every replica in sync in the background.
+        if let Err(e) = admin::refresh_keys(&state).await {
+            tracing::warn!(error = %e, "could not load API keys created through the admin API");
+        }
+        let weak = Arc::downgrade(&state);
+        let every = Duration::from_secs(state.cfg.admin.key_refresh_secs);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                let Some(app) = weak.upgrade() else { break };
+                if let Err(e) = admin::refresh_keys(&app).await {
+                    metrics::counter!("gateway_store_errors_total", "op" => "key_refresh").increment(1);
+                    tracing::warn!(error = %e, "API key refresh failed; keeping the current keys");
+                }
+            }
+        });
+        Ok(state)
     }
 }
 
@@ -85,6 +112,7 @@ pub fn router(state: Arc<AppState>) -> Router {
     let max_body = state.cfg.server.max_body_bytes;
     Router::new()
         .route("/v1/chat/completions", post(proxy::chat_completions))
+        .route("/v1/embeddings", post(proxy::embeddings))
         .route("/v1/models", get(proxy::list_models))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
@@ -101,16 +129,35 @@ pub fn router(state: Arc<AppState>) -> Router {
 
 /// Served on the admin listener only. Do not expose it publicly.
 pub fn admin_router(state: Arc<AppState>, metrics: PrometheusHandle) -> Router {
+    admin_api_router(state).route(
+        "/metrics",
+        get(move || {
+            let m = metrics.clone();
+            async move { m.render() }
+        }),
+    )
+}
+
+/// Dashboard and admin API, without `/metrics` (tests mount this alone
+/// because the Prometheus recorder is process-wide).
+pub fn admin_api_router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route(
-            "/metrics",
-            get(move || {
-                let m = metrics.clone();
-                async move { m.render() }
-            }),
-        )
+        .route("/", get(admin::dashboard))
+        .route("/assets/app.js", get(admin::dashboard_js))
+        .route("/api/overview", get(admin::overview))
+        .route("/api/logs", get(admin::list_logs))
+        .route("/api/logs/:id", get(admin::get_log))
+        .route("/api/keys", get(admin::list_keys).post(admin::create_key))
+        .route("/api/keys/:name", delete(admin::delete_key))
+        .route("/api/config", get(admin::get_config))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::X_CONTENT_TYPE_OPTIONS,
+            HeaderValue::from_static("nosniff"),
+        ))
+        .layer(CatchPanicLayer::new())
         .with_state(state)
 }
 
