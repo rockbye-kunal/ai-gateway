@@ -169,6 +169,11 @@ const KEY_BUDGET: &str = "key-budget";
 const KEY_RESTRICTED: &str = "key-restricted";
 
 async fn start() -> Harness {
+    start_with("").await
+}
+
+/// `extra` is top-level YAML added to the test config.
+async fn start_with(extra: &str) -> Harness {
     let mock = Arc::new(Mock::default());
     let mock_router = Router::new()
         .route("/openai/chat/completions", post(openai))
@@ -188,6 +193,7 @@ async fn start() -> Harness {
     let yaml = format!(
         r#"
 {store}
+{extra}
 server:
   listen: 127.0.0.1:0
   admin_listen: 127.0.0.1:0
@@ -552,4 +558,27 @@ async fn health_endpoints() {
     let r = h.http.get(format!("{}/readyz", h.base)).send().await.unwrap();
     assert_eq!(r.status(), 200);
     assert_eq!(r.headers()["x-content-type-options"], "nosniff");
+}
+
+#[tokio::test]
+async fn default_provider_receives_any_other_model() {
+    let h = start_with("default_provider: openai").await;
+
+    // Not a route and not a configured provider prefix: passed through whole.
+    let r = h.chat(Some(KEY_FULL), hello("meta-llama/llama-3.3-70b")).await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(r.headers()["x-gateway-provider"], "openai");
+    assert_eq!(r.headers()["x-gateway-model"], "meta-llama/llama-3.3-70b");
+    let body: Value = r.json().await.unwrap();
+    assert_eq!(body["model"], "meta-llama/llama-3.3-70b", "upstream saw the full model name");
+
+    // Routes and configured provider prefixes still win.
+    let r = h.chat(Some(KEY_FULL), hello("anthropic/claude-test")).await;
+    assert_eq!(r.headers()["x-gateway-provider"], "anthropic");
+    let r = h.chat(Some(KEY_FULL), hello("smart")).await;
+    assert_eq!(r.status(), 200);
+
+    // Permissions apply to passed-through models too.
+    let r = h.chat(Some(KEY_RESTRICTED), hello("meta-llama/llama-3.3-70b")).await;
+    assert_eq!(r.status(), 403);
 }

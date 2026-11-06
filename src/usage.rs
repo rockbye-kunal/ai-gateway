@@ -21,6 +21,9 @@ use crate::{app::AppState, auth::Tenant};
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// Actual cost in micro-dollars when the provider reports it
+    /// (OpenRouter's `usage.cost`). Preferred over configured prices.
+    pub cost_microusd: Option<u64>,
 }
 
 impl Usage {
@@ -35,7 +38,16 @@ impl Usage {
             return None;
         }
         let get = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
-        Some(Usage { prompt_tokens: get("prompt_tokens"), completion_tokens: get("completion_tokens") })
+        let cost_microusd = u
+            .get("cost")
+            .and_then(Value::as_f64)
+            .filter(|c| c.is_finite() && *c >= 0.0)
+            .map(|c| (c * 1_000_000.0).round() as u64);
+        Some(Usage {
+            prompt_tokens: get("prompt_tokens"),
+            completion_tokens: get("completion_tokens"),
+            cost_microusd,
+        })
     }
 }
 
@@ -100,8 +112,10 @@ impl Drop for Inner {
         let cache = if st.cache_hit { "hit" } else { "miss" };
         let billable = !st.cache_hit && st.usage.total() > 0;
 
-        let cost_usd = match (st.price_input_per_mtok, st.price_output_per_mtok) {
-            (Some(pi), Some(po)) if billable => Some(
+        let cost_usd = match (st.usage.cost_microusd, st.price_input_per_mtok, st.price_output_per_mtok) {
+            _ if !billable => None,
+            (Some(micro), _, _) => Some(micro as f64 / 1_000_000.0),
+            (None, Some(pi), Some(po)) => Some(
                 (st.usage.prompt_tokens as f64 * pi + st.usage.completion_tokens as f64 * po) / 1_000_000.0,
             ),
             _ => None,

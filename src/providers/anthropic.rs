@@ -279,6 +279,7 @@ fn usage_from(u: Option<&Value>) -> Usage {
             + get("cache_creation_input_tokens")
             + get("cache_read_input_tokens"),
         completion_tokens: get("output_tokens"),
+        cost_microusd: None,
     }
 }
 
@@ -574,7 +575,7 @@ mod tests {
             "usage": {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 2}
         });
         let (out, usage) = from_response(&v, "fallback");
-        assert_eq!(usage, Usage { prompt_tokens: 12, completion_tokens: 5 });
+        assert_eq!(usage, Usage { prompt_tokens: 12, completion_tokens: 5, cost_microusd: None });
         assert_eq!(out["choices"][0]["finish_reason"], "tool_calls");
         assert_eq!(out["choices"][0]["message"]["content"], "Checking.");
         let args = out["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"].as_str().unwrap();
@@ -599,7 +600,7 @@ mod tests {
         }
         assert!(t.completed());
         assert_eq!(t.streamed_chars(), 7);
-        assert_eq!(t.usage(), Usage { prompt_tokens: 9, completion_tokens: 7 });
+        assert_eq!(t.usage(), Usage { prompt_tokens: 9, completion_tokens: 7, cost_microusd: None });
         assert_eq!(out.last().unwrap(), "[DONE]");
         let parsed: Vec<Value> =
             out[..out.len() - 1].iter().map(|s| serde_json::from_str(s).unwrap()).collect();

@@ -24,61 +24,60 @@ cache:
   ttl_secs: 300
   max_entry_bytes: 1048576
 
+# Every request goes through OpenRouter unless it names a route below.
+# Clients pick any OpenRouter model per request, e.g. "openai/gpt-4o-mini",
+# "anthropic/claude-haiku-4.5", "google/gemini-2.5-flash",
+# "meta-llama/llama-3.3-70b-instruct". See https://openrouter.ai/models
+default_provider: openrouter
+
 providers:
-  openai:
-    kind: openai
-    base_url: https://api.openai.com/v1
-    api_key: ${OPENAI_API_KEY}
+  openrouter:
+    kind: openai                  # OpenRouter speaks the OpenAI API
+    base_url: https://openrouter.ai/api/v1
+    api_key: ${OPENROUTER_API_KEY}
     timeout_secs: 120
-    stream_idle_timeout_secs: 60
+    stream_idle_timeout_secs: 90  # OpenRouter sends keep-alive comments while a model warms up
     max_retries: 2
     breaker_failure_threshold: 5
     breaker_open_secs: 30
-    # extra_headers:                # sent on every request; values treated as secrets
-    #   OpenAI-Organization: ${OPENAI_ORG_ID}
+    # extra_headers:              # optional: identifies your app in OpenRouter analytics
+    #   HTTP-Referer: https://your-site.example
+    #   X-Title: Your App Name
 
-  anthropic:
-    kind: anthropic
-    base_url: https://api.anthropic.com/v1
-    api_key: ${ANTHROPIC_API_KEY}
-    default_max_tokens: 4096      # used when clients omit max_tokens (Anthropic requires it);
-                                  # keep it at or below the smallest output cap of the models you route here
+  # Direct provider accounts are optional. Uncomment to call a provider
+  # directly as "<name>/<model>" or in route targets.
+  # openai:
+  #   kind: openai
+  #   base_url: https://api.openai.com/v1
+  #   api_key: ${OPENAI_API_KEY}
+  # anthropic:
+  #   kind: anthropic
+  #   base_url: https://api.anthropic.com/v1
+  #   api_key: ${ANTHROPIC_API_KEY}
+  #   default_max_tokens: 4096
+  # azure:
+  #   kind: azure                 # route target `model` is the deployment name
+  #   base_url: https://YOUR-RESOURCE.openai.azure.com/openai/deployments
+  #   api_key: ${AZURE_OPENAI_API_KEY}
+  #   api_version: "2024-10-21"
 
-  gemini:
-    kind: openai                  # Gemini's OpenAI-compatible endpoint
-    base_url: https://generativelanguage.googleapis.com/v1beta/openai
-    api_key: ${GEMINI_API_KEY}
-
-  groq:
-    kind: openai
-    base_url: https://api.groq.com/openai/v1
-    api_key: ${GROQ_API_KEY}
-
-  azure:
-    kind: azure                   # route target `model` is the deployment name
-    base_url: https://YOUR-RESOURCE.openai.azure.com/openai/deployments
-    api_key: ${AZURE_OPENAI_API_KEY}
-    api_version: "2024-10-21"
-
-# Routes are what clients put in `model`. Targets are tried in order:
-# retries happen on each target, then the next target is the fallback.
-# Clients can also call `provider/model` directly (e.g. "openai/gpt-4o-mini")
-# if their key allows it.
+# Routes are stable names clients can use instead of raw model names. Targets
+# are tried in order: retries happen on each target, then the next target is
+# the fallback. Here every fallback is a different model or upstream provider,
+# all reached through OpenRouter.
 routes:
   - name: default
     targets:
-      - provider: openai
-        model: gpt-4o-mini
-        price_input_per_mtok: 0.15
-        price_output_per_mtok: 0.60
-      - provider: gemini
-        model: gemini-2.0-flash
+      - provider: openrouter
+        model: openai/gpt-4o-mini
+      - provider: openrouter
+        model: google/gemini-2.5-flash
   - name: smart
     targets:
-      - provider: anthropic
-        model: claude-sonnet-4-5
-      - provider: openai
-        model: gpt-4o
+      - provider: openrouter
+        model: anthropic/claude-sonnet-4.5
+      - provider: openrouter
+        model: openai/gpt-4o
 
 # Client keys. Create with `ai-gateway generate-key`; store only the hash here.
 keys:
@@ -88,4 +87,6 @@ keys:
     requests_per_minute: 600
     daily_token_budget: 20000000
     max_concurrent_requests: 200           # per instance, so one client can't use all capacity
-    allowed_models: ["default", "smart"]   # or "openai/*", "anthropic/claude-sonnet-4-5", "*"
+    # Route names, "openrouter/*" (any OpenRouter model), a single model such as
+    # "openrouter/anthropic/claude-haiku-4.5", or "*" for everything.
+    allowed_models: ["default", "smart", "openrouter/*"]

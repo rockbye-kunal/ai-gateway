@@ -19,6 +19,7 @@ services:
     build: .
     environment:
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-unset}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-unset}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-unset}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-unset}

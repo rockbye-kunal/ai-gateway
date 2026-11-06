@@ -41,6 +41,8 @@ pub fn effective_usage(t: &dyn StreamTranslator, prompt_estimate: u64) -> Usage 
         // only estimate when nothing was reported.
         prompt_tokens: if reported.prompt_tokens > 0 { reported.prompt_tokens } else { prompt_estimate },
         completion_tokens: reported.completion_tokens.max(t.streamed_chars().div_ceil(CHARS_PER_TOKEN)),
+        // An estimate has no provider-reported cost; configured prices apply.
+        cost_microusd: None,
     }
 }
 

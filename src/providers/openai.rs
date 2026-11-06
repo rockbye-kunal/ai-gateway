@@ -107,6 +107,16 @@ mod tests {
     }
 
     #[test]
+    fn reads_openrouter_cost() {
+        let v = json!({"usage": {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.000123}});
+        let u = Usage::from_openai(&v).unwrap();
+        assert_eq!(u.total(), 15);
+        assert_eq!(u.cost_microusd, Some(123));
+        let v = json!({"usage": {"prompt_tokens": 1, "completion_tokens": 1}});
+        assert_eq!(Usage::from_openai(&v).unwrap().cost_microusd, None);
+    }
+
+    #[test]
     fn hides_usage_chunk_unless_requested() {
         let usage_chunk = r#"{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4}}"#;
         let mut t = Passthrough::new(false);

@@ -252,6 +252,19 @@ fn resolve_targets(app: &AppState, tenant: &Tenant, model: &str) -> Result<Vec<T
             }]);
         }
     }
+    // Anything else goes to the default provider (e.g. OpenRouter) with the
+    // model name unchanged, so clients can pick any model it offers.
+    if let Some(default) = &app.cfg.default_provider {
+        if !tenant.allows_direct(default, model) {
+            return Err(ApiError::forbidden(format!("this API key may not use model '{model}'")));
+        }
+        return Ok(vec![TargetConfig {
+            provider: default.clone(),
+            model: model.to_string(),
+            price_input_per_mtok: None,
+            price_output_per_mtok: None,
+        }]);
+    }
     Err(ApiError::model_not_found(model))
 }
 
@@ -397,7 +410,8 @@ async fn try_target(ctx: &AttemptCtx<'_>, provider: &Provider, target: &TargetCo
                 s.price_output_per_mtok = target.price_output_per_mtok;
                 // The upstream has accepted the prompt. Bill it even if the
                 // client disconnects before the first chunk arrives.
-                s.usage = Usage { prompt_tokens: ctx.prompt_estimate, completion_tokens: 0 };
+                s.usage =
+                    Usage { prompt_tokens: ctx.prompt_estimate, completion_tokens: 0, cost_microusd: None };
             });
             let translator = provider.stream_translator(&target.model, ctx.client_wants_usage);
             let body = Body::from_stream(sse::event_stream(

@@ -46,6 +46,11 @@ pub struct Config {
     pub providers: HashMap<String, ProviderConfig>,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
+    /// Provider that receives any `model` that is neither a route name nor
+    /// `provider/model`, with the model name passed through unchanged.
+    /// Typically an aggregator such as OpenRouter.
+    #[serde(default)]
+    pub default_provider: Option<String>,
     pub keys: Vec<KeyConfig>,
 }
 
@@ -348,6 +353,16 @@ impl Config {
             }
         }
 
+        if let Some(d) = &self.default_provider {
+            match self.providers.get(d) {
+                None => bail!("default_provider '{d}' is not a configured provider"),
+                Some(p) if p.kind == ProviderKind::Azure => {
+                    bail!("default_provider cannot be an azure provider (model names are deployment names)")
+                }
+                Some(_) => {}
+            }
+        }
+
         let mut route_names = HashSet::new();
         for r in &self.routes {
             if !valid_ident(&r.name) {
@@ -556,6 +571,12 @@ keys:
     fn rejects_bad_hash() {
         let yaml = base("").replace(HASH, "abc");
         assert!(Config::from_yaml_str(&yaml).is_err());
+    }
+
+    #[test]
+    fn default_provider_must_exist() {
+        assert!(Config::from_yaml_str(&base("default_provider: openai\n")).is_ok());
+        assert!(Config::from_yaml_str(&base("default_provider: nope\n")).is_err());
     }
 
     #[test]

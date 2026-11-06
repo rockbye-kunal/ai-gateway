@@ -43,11 +43,28 @@ client.chat.completions.create(model="smart", messages=[{"role": "user", "conten
 
 Response headers tell you what happened: `x-request-id`, `x-gateway-provider`, `x-gateway-model`, and `x-gateway-cache: HIT|MISS` when caching is on.
 
+## Using OpenRouter
+
+With `default_provider: openrouter` (as in `config.example.yaml`), every request goes through OpenRouter on your OpenRouter credits, and each request can pick any model it offers:
+
+```python
+client.chat.completions.create(model="anthropic/claude-haiku-4.5", messages=[...])
+client.chat.completions.create(model="google/gemini-2.5-flash", messages=[...])
+client.chat.completions.create(model="smart", messages=[...])   # a route with fallbacks
+```
+
+- A `model` that matches a route name uses that route's targets and fallbacks.
+- A `model` starting with a configured provider name (`openrouter/...`, or `anthropic/...` if you also configured a direct `anthropic` provider) goes to that provider.
+- Anything else is sent to OpenRouter unchanged.
+- Give keys `"openrouter/*"` in `allowed_models` to allow every OpenRouter model, or list specific ones as `"openrouter/anthropic/claude-haiku-4.5"`.
+- OpenRouter-only request fields (such as `models` for OpenRouter-side fallback, or `provider` for provider preferences) are passed through untouched.
+- The actual cost OpenRouter reports for each request is used in the access log and in `gateway_cost_microdollars_total`. No price configuration is needed.
+
 ## How a request flows
 
 1. **Authenticate** — `Authorization: Bearer <key>` or `x-api-key`. The key is hashed and looked up.
 2. **Validate** — JSON object, `model`, non-empty `messages`, body under `max_body_bytes`.
-3. **Resolve** — `model` is a route name or `provider/model`; the key's `allowed_models` must permit it.
+3. **Resolve** — `model` is a route name, `provider/model`, or (with `default_provider` set) any other model name, passed to the default provider; the key's `allowed_models` must permit it.
 4. **Limit** — requests/minute (fixed one-minute window) and daily token budget (UTC day), in Redis.
 5. **Cache** — non-streaming requests are looked up by a hash of key name + full request body.
 6. **Call upstream** — for each target in order: retry up to `max_retries` with backoff; skip a provider whose circuit is open.
