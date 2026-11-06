@@ -22,36 +22,16 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      # Surfaces the first compiler and clippy errors as annotations on the
-      # run and pull request, so they are readable without opening the logs.
-      - name: Compiler diagnostics
-        run: |
-          set +e
-          cargo clippy --all-targets --message-format=short -- -D warnings > clippy.txt 2>&1
-          pattern='^[^ ]+\.rs:[0-9]+:[0-9]+: (error|warning)'
-          to_annotation='s/^([^:]+):([0-9]+):([0-9]+): (.*)$/file=\1,line=\2,col=\3::\4/'
-          grep -E "$pattern" clippy.txt | head -10 | sed -E "$to_annotation" | sed 's/^/::error /'
-          grep -E "$pattern" clippy.txt | sed -n '11,20p' | sed -E "$to_annotation" | sed 's/^/::warning /'
-          exit 0
       - name: Format
         run: cargo fmt --check
       - name: Lint
         run: cargo clippy --all-targets -- -D warnings
       - name: Unit and end-to-end tests (in-memory store)
-        run: |
-          set -o pipefail
-          cargo test 2>&1 | tee test-memory.txt
+        run: cargo test
       - name: End-to-end tests against real Redis
         env:
           AIGW_TEST_REDIS_URL: redis://127.0.0.1:6379/0
-        run: |
-          set -o pipefail
-          cargo test -- --test-threads=4 2>&1 | tee test-redis.txt
-      - name: Test failures
-        if: failure()
-        run: |
-          awk '/panicked at/ {msg=FILENAME": "$0; n=3; next} n>0 {msg=msg" | "$0; n--; if (n==0) print "::error::" msg}' \
-            test-*.txt 2>/dev/null | head -10 || true
+        run: cargo test -- --test-threads=4
       - name: Release build
         run: cargo build --release
 
