@@ -1,0 +1,180 @@
+name: live
+# Builds the release binary, publishes Cargo.lock as an artifact, and, when
+# OPENAI_API_KEY / ANTHROPIC_API_KEY repo secrets exist, runs the gateway
+# against the real providers with Redis and exercises it end to end.
+on:
+  workflow_dispatch:
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s --health-timeout 2s --health-retries 15
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      REDIS_URL: redis://127.0.0.1:6379/0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Publish Cargo.lock
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-lock
+          path: Cargo.lock
+
+      - name: Check which provider keys are present
+        id: keys
+        run: |
+          echo "openai=$([ -n "$OPENAI_API_KEY" ] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
+          echo "anthropic=$([ -n "$ANTHROPIC_API_KEY" ] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
+
+      - name: Write config and client key
+        if: steps.keys.outputs.openai == 'yes' || steps.keys.outputs.anthropic == 'yes'
+        run: |
+          KEY_OUT=$(./target/release/ai-gateway generate-key)
+          GW_KEY=$(echo "$KEY_OUT" | awk '/^api_key:/ {print $2}')
+          GW_HASH=$(echo "$KEY_OUT" | awk '/^key_sha256:/ {print $2}')
+          echo "::add-mask::$GW_KEY"
+          echo "GW_KEY=$GW_KEY" >> "$GITHUB_ENV"
+
+          {
+            echo "server:"
+            echo "  listen: 127.0.0.1:8080"
+            echo "  admin_listen: 127.0.0.1:9090"
+            echo "store:"
+            echo "  backend: redis"
+            echo "  redis_url: \${REDIS_URL}"
+            echo "cache:"
+            echo "  enabled: true"
+            echo "providers:"
+            if [ -n "$OPENAI_API_KEY" ]; then
+              echo "  openai:"
+              echo "    kind: openai"
+              echo "    base_url: https://api.openai.com/v1"
+              echo "    api_key: \${OPENAI_API_KEY}"
+            fi
+            if [ -n "$ANTHROPIC_API_KEY" ]; then
+              echo "  anthropic:"
+              echo "    kind: anthropic"
+              echo "    base_url: https://api.anthropic.com/v1"
+              echo "    api_key: \${ANTHROPIC_API_KEY}"
+            fi
+            # A provider with a dead endpoint, to prove fallback works for real.
+            echo "  broken:"
+            echo "    kind: openai"
+            echo "    base_url: http://127.0.0.1:1/v1"
+            echo "    api_key: not-used"
+            echo "    max_retries: 1"
+            echo "routes:"
+            echo "  - name: fallback"
+            echo "    targets:"
+            echo "      - provider: broken"
+            echo "        model: nothing"
+            if [ -n "$ANTHROPIC_API_KEY" ]; then
+              echo "      - provider: anthropic"
+              echo "        model: claude-haiku-4-5"
+            else
+              echo "      - provider: openai"
+              echo "        model: gpt-4o-mini"
+            fi
+            echo "keys:"
+            echo "  - name: live-test"
+            echo "    key_sha256: \"$GW_HASH\""
+            echo "    requests_per_minute: 12"
+            echo "    allowed_models: [\"*\"]"
+          } > live.yaml
+          ./target/release/ai-gateway check-config live.yaml
+
+      - name: Start gateway
+        if: steps.keys.outputs.openai == 'yes' || steps.keys.outputs.anthropic == 'yes'
+        run: |
+          nohup ./target/release/ai-gateway serve live.yaml > gateway.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf localhost:8080/readyz && break; sleep 1; done
+          curl -sf localhost:8080/healthz
+
+      - name: OpenAI — normal and streaming
+        if: steps.keys.outputs.openai == 'yes'
+        run: |
+          set -euo pipefail
+          H=(-H "Authorization: Bearer $GW_KEY" -H "Content-Type: application/json")
+          curl -sf localhost:8080/v1/chat/completions "${H[@]}" -D h.txt -o b.json \
+            -d '{"model":"openai/gpt-4o-mini","messages":[{"role":"user","content":"Reply with just: pong"}]}'
+          grep -i "x-gateway-provider: openai" h.txt
+          jq -e '.choices[0].message.content | length > 0' b.json
+          jq -e '.usage.total_tokens > 0' b.json
+          echo "OpenAI said: $(jq -r '.choices[0].message.content' b.json)"
+
+          curl -sfN localhost:8080/v1/chat/completions "${H[@]}" -o s.txt \
+            -d '{"model":"openai/gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"Count 1 to 5"}]}'
+          tail -n 3 s.txt
+          grep -q 'data: \[DONE\]' s.txt
+
+      - name: Anthropic — normal, streaming and tool call (translated to OpenAI format)
+        if: steps.keys.outputs.anthropic == 'yes'
+        run: |
+          set -euo pipefail
+          H=(-H "Authorization: Bearer $GW_KEY" -H "Content-Type: application/json")
+          curl -sf localhost:8080/v1/chat/completions "${H[@]}" -o b.json \
+            -d '{"model":"anthropic/claude-haiku-4-5","messages":[{"role":"system","content":"Be terse."},{"role":"user","content":"Reply with just: pong"}]}'
+          jq -e '.object == "chat.completion"' b.json
+          jq -e '.usage.total_tokens > 0' b.json
+          echo "Claude said: $(jq -r '.choices[0].message.content' b.json)"
+
+          curl -sfN localhost:8080/v1/chat/completions "${H[@]}" -o s.txt \
+            -d '{"model":"anthropic/claude-haiku-4-5","stream":true,"messages":[{"role":"user","content":"Count 1 to 5"}]}'
+          grep -q '"object":"chat.completion.chunk"' s.txt
+          grep -q 'data: \[DONE\]' s.txt
+
+          curl -sf localhost:8080/v1/chat/completions "${H[@]}" -o t.json \
+            -d '{"model":"anthropic/claude-haiku-4-5","tool_choice":"required","messages":[{"role":"user","content":"What is the weather in Pune?"}],
+                 "tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]}'
+          jq -e '.choices[0].finish_reason == "tool_calls"' t.json
+          jq -r '.choices[0].message.tool_calls[0].function.arguments' t.json | jq -e '.city | length > 0'
+
+      - name: Fallback, cache, auth, rate limit, metrics
+        if: steps.keys.outputs.openai == 'yes' || steps.keys.outputs.anthropic == 'yes'
+        run: |
+          set -euo pipefail
+          H=(-H "Authorization: Bearer $GW_KEY" -H "Content-Type: application/json")
+
+          # Fallback: first target is down, second must answer.
+          curl -sf localhost:8080/v1/chat/completions "${H[@]}" -D h.txt -o b.json \
+            -d '{"model":"fallback","messages":[{"role":"user","content":"Reply with just: ok"}]}'
+          grep -i "x-gateway-provider" h.txt
+          ! grep -qi "x-gateway-provider: broken" h.txt
+
+          # Cache: identical request is served from cache.
+          curl -sf localhost:8080/v1/chat/completions "${H[@]}" -D h2.txt -o /dev/null \
+            -d '{"model":"fallback","messages":[{"role":"user","content":"Reply with just: ok"}]}'
+          grep -i "x-gateway-cache: HIT" h2.txt
+
+          # Auth: bad key rejected.
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/v1/chat/completions \
+            -H 'Authorization: Bearer wrong' -d '{}')" = "401"
+
+          # Rate limit (12/min): send tiny uncached requests until a 429 arrives.
+          got429=no
+          for i in $(seq 1 15); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/v1/chat/completions "${H[@]}" \
+              -H 'x-gateway-cache: skip' \
+              -d '{"model":"fallback","max_tokens":1,"messages":[{"role":"user","content":"x"}]}')
+            [ "$code" = "429" ] && got429=yes && break
+          done
+          echo "rate limited: $got429"; [ "$got429" = yes ]
+
+          # Metrics show real traffic and token counts.
+          curl -sf localhost:9090/metrics | grep -E '^gateway_(requests_total|tokens_total)' | head -20
+
+      - name: Gateway log
+        if: always() && (steps.keys.outputs.openai == 'yes' || steps.keys.outputs.anthropic == 'yes')
+        run: cat gateway.log || true
