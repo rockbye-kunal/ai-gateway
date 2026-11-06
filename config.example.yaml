@@ -24,6 +24,35 @@ cache:
   ttl_secs: 300
   max_entry_bytes: 1048576
 
+# Dashboard and admin API on admin_listen. Off until token_sha256 is set.
+# Create a token with `ai-gateway generate-key`; put only its hash here.
+admin:
+  # token_sha256: ${ADMIN_TOKEN_SHA256}
+  key_refresh_secs: 5             # replicas pick up dashboard-created keys this often
+
+logging:
+  enabled: true
+  max_entries: 10000              # searchable request log, shared by all replicas
+  capture_bodies: false           # true stores prompts and responses (may contain personal data)
+  max_body_bytes: 32768
+  detail_ttl_secs: 604800         # 7 days
+
+guardrails:
+  rules:
+    - name: no-cards
+      builtin: credit_card        # Luhn-checked
+      action: block               # block | redact | flag
+      apply_to: request           # request | response | both
+    - name: secrets
+      builtin: api_key
+      action: redact
+    # - name: emails
+    #   builtin: email
+    #   action: redact
+    # - name: injection
+    #   builtin: prompt_injection
+    #   action: flag
+
 # Every request goes through OpenRouter unless it names a route below.
 # Clients pick any OpenRouter model per request, e.g. "openai/gpt-4o-mini",
 # "anthropic/claude-haiku-4.5", "google/gemini-2.5-flash",
@@ -73,11 +102,14 @@ routes:
       - provider: openrouter
         model: google/gemini-2.5-flash
   - name: smart
+    strategy: weighted            # 80/20 A/B split; the other target is still the fallback
     targets:
       - provider: openrouter
         model: anthropic/claude-sonnet-4.5
+        weight: 80
       - provider: openrouter
         model: openai/gpt-4o
+        weight: 20
 
 # Client keys. Create with `ai-gateway generate-key`; store only the hash here.
 keys:
