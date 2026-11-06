@@ -15,12 +15,15 @@ name = "ai-gateway"
 path = "src/main.rs"
 
 [dependencies]
+aes-gcm = "0.10"
 anyhow = "1"
 async-stream = "0.3"
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
+base64 = "0.22"
 dashmap = "6"
 futures = "0.3"
 hex = "0.4"
+hmac = "0.12"
 metrics = "0.23"
 metrics-exporter-prometheus = { version = "0.15", default-features = false }
 parking_lot = "0.12"
@@ -35,6 +38,7 @@ serde_yaml = "0.9"
 sha2 = "0.10"
 thiserror = "1"
 tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 tower-http = { version = "0.6", features = ["catch-panic", "set-header"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }

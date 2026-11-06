@@ -1,19 +1,28 @@
-//! AI gateway: a single OpenAI-compatible endpoint that routes requests to
-//! multiple LLM providers with authentication, rate limiting, token budgets,
-//! caching, retries, fallbacks, circuit breaking and metrics.
+//! AI gateway: OpenAI-, Anthropic- and provider-native APIs in front of many
+//! LLM providers, with authentication, routing, fallbacks, limits, budgets,
+//! guardrails, caching, request logs, analytics and an admin dashboard.
 
 pub mod admin;
+pub mod alerts;
 pub mod app;
 pub mod auth;
 pub mod breaker;
 pub mod config;
 pub mod error;
+pub mod export;
 pub mod guardrails;
+pub mod limits;
 pub mod logs;
 pub mod metrics;
+pub mod native;
+pub mod options;
 pub mod providers;
 pub mod proxy;
+pub mod realtime;
+pub mod rules;
+pub mod secrets;
 pub mod sse;
+pub mod stats;
 pub mod store;
 pub mod usage;
 

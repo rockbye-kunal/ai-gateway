@@ -273,13 +273,37 @@ fn map_stop(reason: Option<&str>) -> &'static str {
 }
 
 fn usage_from(u: Option<&Value>) -> Usage {
-    let get = |k: &str| u.and_then(|u| u.get(k)).and_then(Value::as_u64).unwrap_or(0);
-    Usage {
-        prompt_tokens: get("input_tokens")
-            + get("cache_creation_input_tokens")
-            + get("cache_read_input_tokens"),
-        completion_tokens: get("output_tokens"),
-        cost_microusd: None,
+    u.filter(|u| u.is_object()).map(Usage::from_usage_object).unwrap_or_default()
+}
+
+/// Adds Anthropic prompt-caching markers: on the system prompt and on the
+/// last content block of the latest message, so the conversation prefix is
+/// cached between turns. Works on a native Messages API body.
+pub fn add_cache_markers(body: &mut Value) {
+    let marker = json!({"type": "ephemeral"});
+    let Some(obj) = body.as_object_mut() else { return };
+    if let Some(system) = obj.get_mut("system") {
+        if let Some(text) = system.as_str().map(str::to_string) {
+            if !text.is_empty() {
+                *system = json!([{"type": "text", "text": text, "cache_control": marker}]);
+            }
+        } else if let Some(last) = system.as_array_mut().and_then(|a| a.last_mut()) {
+            if last.get("cache_control").is_none() {
+                last["cache_control"] = marker.clone();
+            }
+        }
+    }
+    let Some(last_msg) = obj.get_mut("messages").and_then(Value::as_array_mut).and_then(|m| m.last_mut())
+    else {
+        return;
+    };
+    let Some(content) = last_msg.get_mut("content") else { return };
+    if let Some(text) = content.as_str().map(str::to_string) {
+        *content = json!([{"type": "text", "text": text, "cache_control": marker}]);
+    } else if let Some(block) = content.as_array_mut().and_then(|a| a.last_mut()) {
+        if block.is_object() && block.get("cache_control").is_none() {
+            block["cache_control"] = marker;
+        }
     }
 }
 
@@ -575,7 +599,10 @@ mod tests {
             "usage": {"input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": 2}
         });
         let (out, usage) = from_response(&v, "fallback");
-        assert_eq!(usage, Usage { prompt_tokens: 12, completion_tokens: 5, cost_microusd: None });
+        assert_eq!(
+            usage,
+            Usage { prompt_tokens: 12, completion_tokens: 5, cached_tokens: 2, ..Default::default() }
+        );
         assert_eq!(out["choices"][0]["finish_reason"], "tool_calls");
         assert_eq!(out["choices"][0]["message"]["content"], "Checking.");
         let args = out["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"].as_str().unwrap();
@@ -600,7 +627,7 @@ mod tests {
         }
         assert!(t.completed());
         assert_eq!(t.streamed_chars(), 7);
-        assert_eq!(t.usage(), Usage { prompt_tokens: 9, completion_tokens: 7, cost_microusd: None });
+        assert_eq!(t.usage(), Usage { prompt_tokens: 9, completion_tokens: 7, ..Default::default() });
         assert_eq!(out.last().unwrap(), "[DONE]");
         let parsed: Vec<Value> =
             out[..out.len() - 1].iter().map(|s| serde_json::from_str(s).unwrap()).collect();

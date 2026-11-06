@@ -41,6 +41,8 @@ pub struct StoredKey {
     #[serde(default)]
     pub max_concurrent_requests: Option<usize>,
     pub allowed_models: Vec<String>,
+    #[serde(default)]
+    pub zero_data_retention: bool,
 }
 
 /// Where a tenant's key is defined.
@@ -62,6 +64,7 @@ pub struct Tenant {
     pub concurrency: Option<Arc<Semaphore>>,
     pub max_concurrent_requests: Option<usize>,
     pub source: KeySource,
+    pub zero_data_retention: bool,
     allowed: Vec<String>,
 }
 
@@ -74,6 +77,7 @@ impl Tenant {
             concurrency: k.max_concurrent_requests.map(|n| Arc::new(Semaphore::new(n))),
             max_concurrent_requests: k.max_concurrent_requests,
             source: KeySource::Config,
+            zero_data_retention: k.zero_data_retention,
             allowed: k.allowed_models.clone(),
         }
     }
@@ -86,6 +90,7 @@ impl Tenant {
             concurrency: k.max_concurrent_requests.map(|n| Arc::new(Semaphore::new(n))),
             max_concurrent_requests: k.max_concurrent_requests,
             source: KeySource::Admin,
+            zero_data_retention: k.zero_data_retention,
             allowed: k.allowed_models.clone(),
         }
     }
@@ -113,9 +118,38 @@ impl Tenant {
     }
 }
 
-pub struct KeyRing {
+struct ConfigKeys {
     by_hash: HashMap<String, Arc<Tenant>>,
-    config_names: HashSet<String>,
+    names: HashSet<String>,
+    defs: HashMap<String, (KeyConfig, Arc<Tenant>)>,
+}
+
+impl ConfigKeys {
+    /// Builds config tenants, reusing `prev` tenants whose definition is
+    /// unchanged so their concurrency semaphores carry over a reload.
+    fn build(keys: &[KeyConfig], prev: Option<&ConfigKeys>) -> Self {
+        let mut by_hash = HashMap::new();
+        let mut names = HashSet::new();
+        let mut defs = HashMap::new();
+        for k in keys {
+            let tenant = match prev.and_then(|p| p.defs.get(&k.name)) {
+                Some((old, t)) if old == k => t.clone(),
+                _ => Arc::new(Tenant::from_config(k)),
+            };
+            names.insert(k.name.clone());
+            // Current and previous keys map to the same tenant, so a rotation
+            // keeps the tenant's limits, budget and metrics.
+            for hash in std::iter::once(&k.key_sha256).chain(&k.previous_key_sha256) {
+                by_hash.insert(hash.clone(), tenant.clone());
+            }
+            defs.insert(k.name.clone(), (k.clone(), tenant));
+        }
+        Self { by_hash, names, defs }
+    }
+}
+
+pub struct KeyRing {
+    config: RwLock<ConfigKeys>,
     /// Admin-created keys by hash, with the record they were built from so a
     /// refresh keeps the same tenant (and its concurrency semaphore) when
     /// nothing changed.
@@ -127,18 +161,18 @@ pub struct KeyRing {
 
 impl KeyRing {
     pub fn new(keys: &[KeyConfig]) -> Self {
-        let mut by_hash = HashMap::new();
-        let mut config_names = HashSet::new();
-        for k in keys {
-            let tenant = Arc::new(Tenant::from_config(k));
-            config_names.insert(k.name.clone());
-            // Current and previous keys map to the same tenant, so a rotation
-            // keeps the tenant's limits, budget and metrics.
-            for hash in std::iter::once(&k.key_sha256).chain(&k.previous_key_sha256) {
-                by_hash.insert(hash.clone(), tenant.clone());
-            }
+        Self {
+            config: RwLock::new(ConfigKeys::build(keys, None)),
+            dynamic: RwLock::new(HashMap::new()),
+            generation: AtomicU64::new(0),
         }
-        Self { by_hash, config_names, dynamic: RwLock::new(HashMap::new()), generation: AtomicU64::new(0) }
+    }
+
+    /// Replaces the config-file keys (config reload).
+    pub fn set_config(&self, keys: &[KeyConfig]) {
+        let mut cur = self.config.write();
+        let next = ConfigKeys::build(keys, Some(&cur));
+        *cur = next;
     }
 
     pub fn authenticate(&self, headers: &HeaderMap) -> Result<Arc<Tenant>, ApiError> {
@@ -148,7 +182,7 @@ impl KeyRing {
         // safe against timing attacks: learning which hash prefix matched says
         // nothing useful about any real key.
         let hash = hash_key(key);
-        if let Some(t) = self.by_hash.get(&hash) {
+        if let Some(t) = self.config.read().by_hash.get(&hash) {
             return Ok(t.clone());
         }
         self.dynamic
@@ -159,11 +193,11 @@ impl KeyRing {
     }
 
     pub fn is_config_name(&self, name: &str) -> bool {
-        self.config_names.contains(name)
+        self.config.read().names.contains(name)
     }
 
     pub fn is_config_hash(&self, hash: &str) -> bool {
-        self.by_hash.contains_key(hash)
+        self.config.read().by_hash.contains_key(hash)
     }
 
     /// Replaces the admin-created keys with `records` (hash → key), reusing
@@ -195,8 +229,9 @@ impl KeyRing {
         records: HashMap<String, StoredKey>,
     ) {
         let mut next = HashMap::with_capacity(records.len());
+        let cfg = self.config.read();
         for (hash, rec) in records {
-            if self.config_names.contains(&rec.name) || self.by_hash.contains_key(&hash) {
+            if cfg.names.contains(&rec.name) || cfg.by_hash.contains_key(&hash) {
                 continue;
             }
             let tenant = match cur.remove(&hash) {
@@ -223,13 +258,8 @@ impl KeyRing {
 
     /// Every tenant, config keys first, each once, sorted by name within its group.
     pub fn tenants(&self) -> Vec<(Arc<Tenant>, Option<StoredKey>)> {
-        let mut seen = HashSet::new();
-        let mut config: Vec<(Arc<Tenant>, Option<StoredKey>)> = self
-            .by_hash
-            .values()
-            .filter(|t| seen.insert(t.name.clone()))
-            .map(|t| (t.clone(), None))
-            .collect();
+        let mut config: Vec<(Arc<Tenant>, Option<StoredKey>)> =
+            self.config.read().defs.values().map(|(_, t)| (t.clone(), None)).collect();
         config.sort_by(|a, b| a.0.name.cmp(&b.0.name));
         let mut dynamic: Vec<(Arc<Tenant>, Option<StoredKey>)> =
             self.dynamic.read().values().map(|(rec, t)| (t.clone(), Some(rec.clone()))).collect();
@@ -283,6 +313,7 @@ mod tests {
             daily_token_budget: None,
             max_concurrent_requests: Some(2),
             allowed_models: vec!["*".into()],
+            zero_data_retention: false,
         }
     }
 
@@ -326,6 +357,7 @@ mod tests {
             daily_token_budget: None,
             max_concurrent_requests: None,
             allowed_models: vec!["smart".into(), "openai/*".into(), "anthropic/claude-x".into()],
+            zero_data_retention: false,
         }])
     }
 
