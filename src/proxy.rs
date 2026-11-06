@@ -387,7 +387,7 @@ async fn handle(
     let cache_key = (rt.cfg.cache.enabled && endpoint.cacheable() && !zdr && !opts.skip_cache).then(|| {
         match &opts.cache_key {
             Some(k) => custom_cache_key(&tenant.name, k),
-            None => cache_key(&tenant.name, endpoint, &req),
+            None => cache_key(&tenant.name, endpoint, &req, &targets, &opts),
         }
     });
     let cache_ttl = opts.cache_ttl.unwrap_or(rt.cfg.cache.ttl_secs);
@@ -842,13 +842,33 @@ pub fn on_store_error(rt: &Runtime, op: &'static str, e: StoreError) -> Result<(
 
 /// Cache entries are scoped per tenant so one client can never read another
 /// client's cached completion.
-fn cache_key(tenant: &str, endpoint: Endpoint, req: &Value) -> String {
+/// The key covers everything that changes the answer: the body, the
+/// targets the request would be routed to (which depend on metadata,
+/// `order`, `only`, fallbacks and rules) and any client-supplied provider key.
+fn cache_key(
+    tenant: &str,
+    endpoint: Endpoint,
+    req: &Value,
+    targets: &[TargetConfig],
+    opts: &RequestOptions,
+) -> String {
     let mut h = Sha256::new();
     h.update(tenant.as_bytes());
     h.update([0u8]);
     h.update(endpoint.as_str().as_bytes());
     h.update([0u8]);
     h.update(serde_json::to_vec(req).unwrap_or_default());
+    for t in targets {
+        h.update([0u8]);
+        h.update(t.provider.as_bytes());
+        h.update(b"/");
+        h.update(t.model.as_bytes());
+    }
+    for (p, k) in &opts.byok {
+        h.update([1u8]);
+        h.update(p.as_bytes());
+        h.update(Sha256::digest(k.as_bytes()));
+    }
     format!("cache:{}", hex::encode(h.finalize()))
 }
 
@@ -1280,9 +1300,17 @@ mod tests {
     #[test]
     fn cache_keys_are_tenant_scoped() {
         let req = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
-        assert_ne!(cache_key("a", Endpoint::Chat, &req), cache_key("b", Endpoint::Chat, &req));
-        assert_ne!(cache_key("a", Endpoint::Chat, &req), cache_key("a", Endpoint::Embeddings, &req));
-        assert_eq!(cache_key("a", Endpoint::Chat, &req), cache_key("a", Endpoint::Chat, &req.clone()));
+        let t1 = vec![direct_target("p", "m")];
+        let t2 = vec![direct_target("q", "m")];
+        let o = RequestOptions::default();
+        let k = |tenant: &str, ep: Endpoint, t: &[TargetConfig]| cache_key(tenant, ep, &req, t, &o);
+        assert_ne!(k("a", Endpoint::Chat, &t1), k("b", Endpoint::Chat, &t1));
+        assert_ne!(k("a", Endpoint::Chat, &t1), k("a", Endpoint::Embeddings, &t1));
+        assert_ne!(k("a", Endpoint::Chat, &t1), k("a", Endpoint::Chat, &t2), "routing changes the key");
+        assert_eq!(k("a", Endpoint::Chat, &t1), k("a", Endpoint::Chat, &t1));
+        let mut byok = RequestOptions::default();
+        byok.byok.insert("p".into(), "sk".into());
+        assert_ne!(cache_key("a", Endpoint::Chat, &req, &t1, &byok), k("a", Endpoint::Chat, &t1));
         assert_ne!(custom_cache_key("a", "k"), custom_cache_key("b", "k"));
     }
 

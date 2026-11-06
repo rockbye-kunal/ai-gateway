@@ -74,9 +74,14 @@ pub async fn handler(
         Err(e) => finish(&guard, Err(e)),
         Ok(upstream) => {
             guard.update(|s| s.status = 101);
-            ws.protocols(["realtime"])
+            let mut r = ws
+                .protocols(["realtime"])
                 .on_upgrade(move |socket| relay(socket, upstream, guard))
-                .into_response()
+                .into_response();
+            if let Ok(v) = HeaderValue::from_str(&request_id) {
+                r.headers_mut().insert("x-request-id", v);
+            }
+            r
         }
     }
 }
