@@ -34,6 +34,12 @@ jobs:
           name: cargo-lock
           path: Cargo.lock
 
+      - name: Print Cargo.lock
+        run: |
+          echo "----- BEGIN CARGO.LOCK -----"
+          cat Cargo.lock
+          echo "----- END CARGO.LOCK -----"
+
       - name: Check which provider keys are present
         id: keys
         run: |
