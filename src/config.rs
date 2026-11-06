@@ -52,6 +52,99 @@ pub struct Config {
     #[serde(default)]
     pub default_provider: Option<String>,
     pub keys: Vec<KeyConfig>,
+    #[serde(default)]
+    pub admin: AdminConfig,
+    #[serde(default)]
+    pub logging: LoggingConfig,
+    #[serde(default)]
+    pub guardrails: GuardrailsConfig,
+}
+
+/// The admin API and dashboard, served on `server.admin_listen`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AdminConfig {
+    /// Lowercase hex SHA-256 of the admin token (`ai-gateway generate-key`).
+    /// The admin API and dashboard are disabled while this is unset.
+    pub token_sha256: Option<String>,
+    /// How often each replica reloads API keys created through the admin API.
+    /// A key revoked on one replica stops working everywhere within this time.
+    pub key_refresh_secs: u64,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        Self { token_sha256: None, key_refresh_secs: 5 }
+    }
+}
+
+/// Request logs and analytics shown in the dashboard.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LoggingConfig {
+    pub enabled: bool,
+    /// Most recent requests kept in the searchable log (shared by all replicas).
+    pub max_entries: usize,
+    /// Also store prompts and responses. Off by default: they may contain
+    /// personal data. Guardrail redactions are applied before capture.
+    pub capture_bodies: bool,
+    /// Prompt and response text longer than this is truncated in the log.
+    pub max_body_bytes: usize,
+    /// How long a request's full detail (including bodies) is kept.
+    pub detail_ttl_secs: u64,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_entries: 10_000,
+            capture_bodies: false,
+            max_body_bytes: 32 * 1024,
+            detail_ttl_secs: 7 * 86_400,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct GuardrailsConfig {
+    pub rules: Vec<GuardrailRule>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardAction {
+    /// Reject the request (or response) with an error.
+    Block,
+    /// Replace each match with `[REDACTED:<rule>]` and continue.
+    Redact,
+    /// Let it through unchanged and record the match in the request log.
+    Flag,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardScope {
+    Request,
+    Response,
+    #[default]
+    Both,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GuardrailRule {
+    pub name: String,
+    /// One of the built-in detectors (see `guardrails::BUILTINS`).
+    #[serde(default)]
+    pub builtin: Option<String>,
+    /// A custom regular expression (Rust `regex` syntax).
+    #[serde(default)]
+    pub pattern: Option<String>,
+    pub action: GuardAction,
+    #[serde(default)]
+    pub apply_to: GuardScope,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -223,8 +316,21 @@ fn d_open() -> u64 {
 pub struct RouteConfig {
     /// The name clients send as `model`.
     pub name: String,
+    #[serde(default)]
+    pub strategy: RouteStrategy,
     /// Tried in order; later targets are fallbacks.
     pub targets: Vec<TargetConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteStrategy {
+    /// Always start with the first target; the rest are fallbacks in order.
+    #[default]
+    Fallback,
+    /// Pick the first target at random by `weight` (A/B tests, gradual
+    /// rollouts, load spreading); the others remain fallbacks in order.
+    Weighted,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -238,6 +344,10 @@ pub struct TargetConfig {
     /// USD per million output tokens, for cost reporting.
     #[serde(default)]
     pub price_output_per_mtok: Option<f64>,
+    /// Share of traffic for `strategy: weighted` routes (default 1). A weight
+    /// of 0 makes the target a fallback only.
+    #[serde(default)]
+    pub weight: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -374,6 +484,14 @@ impl Config {
             if r.targets.is_empty() {
                 bail!("route '{}' has no targets", r.name);
             }
+            if r.strategy == RouteStrategy::Weighted {
+                let total: u64 = r.targets.iter().map(|t| u64::from(t.weight.unwrap_or(1))).sum();
+                if total == 0 {
+                    bail!("route '{}': at least one target needs a weight above 0", r.name);
+                }
+            } else if r.targets.iter().any(|t| t.weight.is_some()) {
+                bail!("route '{}': weight is only used with strategy: weighted", r.name);
+            }
             for t in &r.targets {
                 let Some(p) = self.providers.get(&t.provider) else {
                     bail!("route '{}' references unknown provider '{}'", r.name, t.provider);
@@ -400,7 +518,7 @@ impl Config {
                 bail!("duplicate key name '{}'", k.name);
             }
             for hash in std::iter::once(&k.key_sha256).chain(&k.previous_key_sha256) {
-                if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)) {
+                if !is_sha256_hex(hash) {
                     bail!("key '{}': key hashes must be 64 lowercase hex characters", k.name);
                 }
                 if !key_hashes.insert(hash.as_str()) {
@@ -414,8 +532,31 @@ impl Config {
                 bail!("key '{}': allowed_models must list at least one entry", k.name);
             }
         }
+
+        if let Some(h) = &self.admin.token_sha256 {
+            if !is_sha256_hex(h) {
+                bail!("admin.token_sha256 must be 64 lowercase hex characters");
+            }
+            if key_hashes.contains(h.as_str()) {
+                bail!("admin.token_sha256 must not be the same as a client key");
+            }
+        }
+        if self.admin.key_refresh_secs == 0 {
+            bail!("admin.key_refresh_secs must be greater than 0");
+        }
+        if self.logging.max_entries == 0 || self.logging.max_entries > 1_000_000 {
+            bail!("logging.max_entries must be between 1 and 1000000");
+        }
+        if self.logging.detail_ttl_secs == 0 {
+            bail!("logging.detail_ttl_secs must be greater than 0");
+        }
+        crate::guardrails::Guardrails::compile(&self.guardrails)?;
         Ok(())
     }
+}
+
+pub fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
 impl Config {
@@ -443,6 +584,23 @@ impl Config {
                     r.name
                 ));
             }
+        }
+        if self.guardrails.rules.iter().any(|r| r.apply_to != GuardScope::Request) {
+            out.push(
+                "guardrails on responses apply to non-streaming responses only; \
+                 streamed responses are not checked"
+                    .into(),
+            );
+        }
+        if self.admin.token_sha256.is_none() {
+            out.push("admin.token_sha256 is not set; the admin API and dashboard are disabled".into());
+        }
+        if self.logging.capture_bodies {
+            out.push(
+                "logging.capture_bodies is on: prompts and responses are stored in the log; \
+                 make sure that is allowed for your data"
+                    .into(),
+            );
         }
         out
     }
@@ -592,6 +750,38 @@ keys:
         assert_eq!(expand_env("${AIGW_TEST_MISSING:-fallback}").unwrap(), "fallback");
         assert!(expand_env("${AIGW_TEST_MISSING}").is_err());
         assert!(expand_env("${unterminated").is_err());
+    }
+
+    #[test]
+    fn weighted_routes() {
+        let ok = base(
+            "routes:\n  - name: ab\n    strategy: weighted\n    targets:\n      - provider: openai\n        model: a\n        weight: 90\n      - provider: openai\n        model: b\n        weight: 10\n",
+        );
+        assert!(Config::from_yaml_str(&ok).is_ok());
+        let zero = ok.replace("weight: 90", "weight: 0").replace("weight: 10", "weight: 0");
+        assert!(Config::from_yaml_str(&zero).is_err());
+        let no_strategy = ok.replace("    strategy: weighted\n", "");
+        assert!(Config::from_yaml_str(&no_strategy).is_err());
+    }
+
+    #[test]
+    fn admin_token_must_be_a_hash() {
+        assert!(Config::from_yaml_str(&base("admin:\n  token_sha256: nope\n")).is_err());
+        let other = "1".repeat(64);
+        assert!(Config::from_yaml_str(&base(&format!("admin:\n  token_sha256: \"{other}\"\n"))).is_ok());
+        // Reusing a client key hash as the admin token is rejected.
+        assert!(Config::from_yaml_str(&base(&format!("admin:\n  token_sha256: \"{HASH}\"\n"))).is_err());
+    }
+
+    #[test]
+    fn guardrail_rules_are_validated() {
+        let good =
+            base("guardrails:\n  rules:\n    - name: email\n      builtin: email\n      action: redact\n");
+        assert!(Config::from_yaml_str(&good).is_ok());
+        let unknown = good.replace("builtin: email", "builtin: nope");
+        assert!(Config::from_yaml_str(&unknown).is_err());
+        let bad_regex = good.replace("builtin: email", "pattern: \"(\"");
+        assert!(Config::from_yaml_str(&bad_regex).is_err());
     }
 
     #[test]

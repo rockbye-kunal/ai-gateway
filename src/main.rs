@@ -11,7 +11,7 @@ ai-gateway — OpenAI-compatible AI gateway
 USAGE:
   ai-gateway [serve] [CONFIG]      Run the gateway (default config: $GATEWAY_CONFIG or ./config.yaml)
   ai-gateway check-config [CONFIG] Validate a config file and exit
-  ai-gateway generate-key          Print a new client API key and its SHA-256 for the config
+  ai-gateway generate-key          Print a new random key and its SHA-256 (client keys and admin.token_sha256)
   ai-gateway hash-key              Read a key on stdin and print its SHA-256
 ";
 
@@ -94,6 +94,8 @@ async fn main() -> anyhow::Result<()> {
         routes = cfg.routes.len(),
         keys = cfg.keys.len(),
         store = ?cfg.store.backend,
+        admin_api = cfg.admin.token_sha256.is_some(),
+        guardrails = cfg.guardrails.rules.len(),
         "ai-gateway started"
     );
 

@@ -1,14 +1,55 @@
 //! Client authentication. Only SHA-256 hashes of gateway keys are stored in
-//! config, so a leaked config file does not leak usable keys.
+//! config or the store, so a leaked config file or Redis dump does not leak
+//! usable keys.
+//!
+//! Keys come from two places: the config file (changed by a rolling restart)
+//! and the admin API (stored in the shared store and reloaded by every
+//! replica every `admin.key_refresh_secs`).
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
 use axum::http::{header::AUTHORIZATION, HeaderMap};
+use parking_lot::RwLock;
 use rand::{rngs::OsRng, RngCore};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 
 use crate::{config::KeyConfig, error::ApiError};
+
+/// Store hash holding keys created through the admin API: field = key hash,
+/// value = JSON `StoredKey`.
+pub const STORED_KEYS: &str = "apikeys";
+
+/// A key created through the admin API. The key itself is never stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredKey {
+    pub name: String,
+    /// First characters of the key, shown so people can tell keys apart.
+    pub key_hint: String,
+    pub created_at: u64,
+    #[serde(default)]
+    pub requests_per_minute: Option<u64>,
+    #[serde(default)]
+    pub daily_token_budget: Option<u64>,
+    #[serde(default)]
+    pub max_concurrent_requests: Option<usize>,
+    pub allowed_models: Vec<String>,
+}
+
+/// Where a tenant's key is defined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeySource {
+    Config,
+    Admin,
+}
 
 const MAX_KEY_LEN: usize = 512;
 
@@ -19,10 +60,40 @@ pub struct Tenant {
     pub daily_token_budget: Option<u64>,
     /// Per-instance in-flight cap for this tenant, if configured.
     pub concurrency: Option<Arc<Semaphore>>,
+    pub max_concurrent_requests: Option<usize>,
+    pub source: KeySource,
     allowed: Vec<String>,
 }
 
 impl Tenant {
+    fn from_config(k: &KeyConfig) -> Self {
+        Tenant {
+            name: k.name.clone(),
+            requests_per_minute: k.requests_per_minute,
+            daily_token_budget: k.daily_token_budget,
+            concurrency: k.max_concurrent_requests.map(|n| Arc::new(Semaphore::new(n))),
+            max_concurrent_requests: k.max_concurrent_requests,
+            source: KeySource::Config,
+            allowed: k.allowed_models.clone(),
+        }
+    }
+
+    fn from_stored(k: &StoredKey) -> Self {
+        Tenant {
+            name: k.name.clone(),
+            requests_per_minute: k.requests_per_minute,
+            daily_token_budget: k.daily_token_budget,
+            concurrency: k.max_concurrent_requests.map(|n| Arc::new(Semaphore::new(n))),
+            max_concurrent_requests: k.max_concurrent_requests,
+            source: KeySource::Admin,
+            allowed: k.allowed_models.clone(),
+        }
+    }
+
+    pub fn allowed_models(&self) -> &[String] {
+        &self.allowed
+    }
+
     /// Whether this key may call a configured route by name.
     pub fn allows_route(&self, route: &str) -> bool {
         self.allowed.iter().any(|p| p == "*" || p == route)
@@ -44,26 +115,30 @@ impl Tenant {
 
 pub struct KeyRing {
     by_hash: HashMap<String, Arc<Tenant>>,
+    config_names: HashSet<String>,
+    /// Admin-created keys by hash, with the record they were built from so a
+    /// refresh keeps the same tenant (and its concurrency semaphore) when
+    /// nothing changed.
+    dynamic: RwLock<HashMap<String, (StoredKey, Arc<Tenant>)>>,
+    /// Bumped on every local change, so a background refresh that read the
+    /// store before the change cannot undo it.
+    generation: AtomicU64,
 }
 
 impl KeyRing {
     pub fn new(keys: &[KeyConfig]) -> Self {
         let mut by_hash = HashMap::new();
+        let mut config_names = HashSet::new();
         for k in keys {
-            let tenant = Arc::new(Tenant {
-                name: k.name.clone(),
-                requests_per_minute: k.requests_per_minute,
-                daily_token_budget: k.daily_token_budget,
-                concurrency: k.max_concurrent_requests.map(|n| Arc::new(Semaphore::new(n))),
-                allowed: k.allowed_models.clone(),
-            });
+            let tenant = Arc::new(Tenant::from_config(k));
+            config_names.insert(k.name.clone());
             // Current and previous keys map to the same tenant, so a rotation
             // keeps the tenant's limits, budget and metrics.
             for hash in std::iter::once(&k.key_sha256).chain(&k.previous_key_sha256) {
                 by_hash.insert(hash.clone(), tenant.clone());
             }
         }
-        Self { by_hash }
+        Self { by_hash, config_names, dynamic: RwLock::new(HashMap::new()), generation: AtomicU64::new(0) }
     }
 
     pub fn authenticate(&self, headers: &HeaderMap) -> Result<Arc<Tenant>, ApiError> {
@@ -72,11 +147,99 @@ impl KeyRing {
         // Keys are high-entropy random strings, so looking up their hash is
         // safe against timing attacks: learning which hash prefix matched says
         // nothing useful about any real key.
-        self.by_hash.get(&hash_key(key)).cloned().ok_or_else(|| ApiError::unauthorized("invalid API key"))
+        let hash = hash_key(key);
+        if let Some(t) = self.by_hash.get(&hash) {
+            return Ok(t.clone());
+        }
+        self.dynamic
+            .read()
+            .get(&hash)
+            .map(|(_, t)| t.clone())
+            .ok_or_else(|| ApiError::unauthorized("invalid API key"))
+    }
+
+    pub fn is_config_name(&self, name: &str) -> bool {
+        self.config_names.contains(name)
+    }
+
+    pub fn is_config_hash(&self, hash: &str) -> bool {
+        self.by_hash.contains_key(hash)
+    }
+
+    /// Replaces the admin-created keys with `records` (hash → key), reusing
+    /// existing tenants whose record is unchanged. Records whose name clashes
+    /// with a config key, or whose hash is a config key, are ignored.
+    pub fn replace_dynamic(&self, records: HashMap<String, StoredKey>) {
+        let mut cur = self.dynamic.write();
+        self.apply_records(&mut cur, records);
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Like `replace_dynamic`, but skipped (returning false) if a key was
+    /// created or revoked locally since `seen` was read.
+    pub fn replace_dynamic_if_unchanged(&self, seen: u64, records: HashMap<String, StoredKey>) -> bool {
+        let mut cur = self.dynamic.write();
+        if self.generation.load(Ordering::SeqCst) != seen {
+            return false;
+        }
+        self.apply_records(&mut cur, records);
+        true
+    }
+
+    fn apply_records(
+        &self,
+        cur: &mut HashMap<String, (StoredKey, Arc<Tenant>)>,
+        records: HashMap<String, StoredKey>,
+    ) {
+        let mut next = HashMap::with_capacity(records.len());
+        for (hash, rec) in records {
+            if self.config_names.contains(&rec.name) || self.by_hash.contains_key(&hash) {
+                continue;
+            }
+            let tenant = match cur.remove(&hash) {
+                Some((old, t)) if old == rec => t,
+                _ => Arc::new(Tenant::from_stored(&rec)),
+            };
+            next.insert(hash, (rec, tenant));
+        }
+        *cur = next;
+    }
+
+    pub fn upsert_dynamic(&self, hash: String, rec: StoredKey) {
+        let tenant = Arc::new(Tenant::from_stored(&rec));
+        let mut cur = self.dynamic.write();
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        cur.insert(hash, (rec, tenant));
+    }
+
+    pub fn remove_dynamic(&self, hash: &str) {
+        let mut cur = self.dynamic.write();
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        cur.remove(hash);
+    }
+
+    /// Every tenant, config keys first, each once, sorted by name within its group.
+    pub fn tenants(&self) -> Vec<(Arc<Tenant>, Option<StoredKey>)> {
+        let mut seen = HashSet::new();
+        let mut config: Vec<(Arc<Tenant>, Option<StoredKey>)> = self
+            .by_hash
+            .values()
+            .filter(|t| seen.insert(t.name.clone()))
+            .map(|t| (t.clone(), None))
+            .collect();
+        config.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+        let mut dynamic: Vec<(Arc<Tenant>, Option<StoredKey>)> =
+            self.dynamic.read().values().map(|(rec, t)| (t.clone(), Some(rec.clone()))).collect();
+        dynamic.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+        config.extend(dynamic);
+        config
     }
 }
 
-fn extract_key(headers: &HeaderMap) -> Option<&str> {
+pub fn extract_key(headers: &HeaderMap) -> Option<&str> {
     if let Some(v) = headers.get(AUTHORIZATION) {
         let v = v.to_str().ok()?.trim();
         // to_str() guarantees visible ASCII, so byte slicing is safe.
@@ -110,6 +273,49 @@ pub fn generate_key() -> String {
 mod tests {
     use super::*;
     use axum::http::HeaderValue;
+
+    fn stored(name: &str) -> StoredKey {
+        StoredKey {
+            name: name.into(),
+            key_hint: "gw_1234".into(),
+            created_at: 0,
+            requests_per_minute: None,
+            daily_token_budget: None,
+            max_concurrent_requests: Some(2),
+            allowed_models: vec!["*".into()],
+        }
+    }
+
+    #[test]
+    fn dynamic_keys_authenticate_and_refresh() {
+        let r = ring();
+        let mut h = HeaderMap::new();
+        h.insert(AUTHORIZATION, HeaderValue::from_static("Bearer dyn-key"));
+        assert!(r.authenticate(&h).is_err());
+
+        r.upsert_dynamic(hash_key("dyn-key"), stored("beta"));
+        let t1 = r.authenticate(&h).unwrap();
+        assert_eq!(t1.name, "beta");
+        assert_eq!(t1.source, KeySource::Admin);
+
+        // An unchanged record keeps the same tenant (and semaphore).
+        r.replace_dynamic(HashMap::from([(hash_key("dyn-key"), stored("beta"))]));
+        assert!(Arc::ptr_eq(&t1, &r.authenticate(&h).unwrap()));
+
+        // Names that clash with config keys are ignored.
+        r.replace_dynamic(HashMap::from([(hash_key("dyn-key"), stored("acme"))]));
+        assert!(r.authenticate(&h).is_err());
+
+        // A refresh that started before a local change does not undo it.
+        let seen = r.generation();
+        r.upsert_dynamic(hash_key("dyn-key"), stored("beta"));
+        assert!(!r.replace_dynamic_if_unchanged(seen, HashMap::new()));
+        assert!(r.authenticate(&h).is_ok());
+
+        r.remove_dynamic(&hash_key("dyn-key"));
+        assert!(r.authenticate(&h).is_err());
+        assert_eq!(r.tenants().len(), 1);
+    }
 
     fn ring() -> KeyRing {
         KeyRing::new(&[KeyConfig {

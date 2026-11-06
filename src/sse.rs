@@ -209,6 +209,7 @@ pub fn event_stream(
                     let usage = effective_usage(translator.as_ref(), prompt_estimate);
                     guard.update(|s| s.usage = usage);
                     for payload in std::mem::take(&mut out) {
+                        guard.capture_stream_chunk(&payload);
                         yield Ok(Bytes::from(format!("data: {payload}\n\n")));
                     }
                     if translator.completed() {

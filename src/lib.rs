@@ -2,11 +2,14 @@
 //! multiple LLM providers with authentication, rate limiting, token budgets,
 //! caching, retries, fallbacks, circuit breaking and metrics.
 
+pub mod admin;
 pub mod app;
 pub mod auth;
 pub mod breaker;
 pub mod config;
 pub mod error;
+pub mod guardrails;
+pub mod logs;
 pub mod metrics;
 pub mod providers;
 pub mod proxy;

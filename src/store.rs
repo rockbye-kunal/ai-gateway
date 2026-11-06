@@ -5,6 +5,7 @@
 //! or local development.
 
 use std::{
+    collections::{HashMap, VecDeque},
     future::Future,
     sync::Arc,
     time::{Duration, Instant},
@@ -12,6 +13,7 @@ use std::{
 
 use anyhow::Context;
 use dashmap::DashMap;
+use parking_lot::Mutex;
 use redis::{aio::ConnectionManager, AsyncCommands, Script};
 
 use crate::config::{StoreBackend, StoreConfig};
@@ -87,6 +89,9 @@ impl Store {
                     conn,
                     prefix: cfg.key_prefix.clone(),
                     timeout: Duration::from_millis(cfg.op_timeout_ms),
+                    // Admin reads and background writes (logs, analytics)
+                    // are off the request path and may take longer.
+                    slow_timeout: Duration::from_millis(cfg.op_timeout_ms.max(5_000)),
                     incr: Arc::new(Script::new(INCR_LUA)),
                     incr_once: Arc::new(Script::new(INCR_ONCE_LUA)),
                 };
@@ -154,6 +159,95 @@ impl Store {
             Store::Redis(r) => r.ping().await,
         }
     }
+
+    /// Pushes `value` to the front of a list and trims it to `max` items.
+    pub async fn list_push_capped(&self, key: &str, value: &str, max: usize) -> Result<(), StoreError> {
+        match self {
+            Store::Memory(m) => {
+                m.list_push_capped(key, value, max);
+                Ok(())
+            }
+            Store::Redis(r) => r.list_push_capped(key, value, max).await,
+        }
+    }
+
+    /// Up to `limit` items from the front of a list (newest first).
+    pub async fn list_range(&self, key: &str, limit: usize) -> Result<Vec<String>, StoreError> {
+        match self {
+            Store::Memory(m) => Ok(m.list_range(key, limit)),
+            Store::Redis(r) => r.list_range(key, limit).await,
+        }
+    }
+
+    pub async fn kv_set(&self, key: &str, value: &str, ttl_secs: u64) -> Result<(), StoreError> {
+        match self {
+            Store::Memory(m) => {
+                m.kv_set(key, value, ttl_secs);
+                Ok(())
+            }
+            Store::Redis(r) => r.kv_set(key, value, ttl_secs).await,
+        }
+    }
+
+    pub async fn kv_get(&self, key: &str) -> Result<Option<String>, StoreError> {
+        match self {
+            Store::Memory(m) => Ok(m.kv_get(key)),
+            Store::Redis(r) => r.kv_get(key).await,
+        }
+    }
+
+    /// Adds each `(field, delta)` to a hash of counters and sets its expiry.
+    pub async fn hincr_many(
+        &self,
+        key: &str,
+        fields: &[(String, i64)],
+        ttl_secs: u64,
+    ) -> Result<(), StoreError> {
+        if fields.is_empty() {
+            return Ok(());
+        }
+        match self {
+            Store::Memory(m) => {
+                m.hincr_many(key, fields, ttl_secs);
+                Ok(())
+            }
+            Store::Redis(r) => r.hincr_many(key, fields, ttl_secs).await,
+        }
+    }
+
+    /// Reads several counter hashes in one round trip. Missing keys are empty.
+    pub async fn hgetall_many(&self, keys: &[String]) -> Result<Vec<HashMap<String, i64>>, StoreError> {
+        match self {
+            Store::Memory(m) => Ok(keys.iter().map(|k| m.hgetall_counters(k)).collect()),
+            Store::Redis(r) => r.hgetall_many(keys).await,
+        }
+    }
+
+    /// Sets a field of a persistent (non-expiring) string hash.
+    pub async fn hset(&self, key: &str, field: &str, value: &str) -> Result<(), StoreError> {
+        match self {
+            Store::Memory(m) => {
+                m.hashes.entry(key.to_owned()).or_default().insert(field.to_owned(), value.to_owned());
+                Ok(())
+            }
+            Store::Redis(r) => r.hset(key, field, value).await,
+        }
+    }
+
+    /// Removes a field; returns whether it existed.
+    pub async fn hdel(&self, key: &str, field: &str) -> Result<bool, StoreError> {
+        match self {
+            Store::Memory(m) => Ok(m.hashes.get_mut(key).is_some_and(|mut h| h.remove(field).is_some())),
+            Store::Redis(r) => r.hdel(key, field).await,
+        }
+    }
+
+    pub async fn hgetall(&self, key: &str) -> Result<HashMap<String, String>, StoreError> {
+        match self {
+            Store::Memory(m) => Ok(m.hashes.get(key).map(|h| h.value().clone()).unwrap_or_default()),
+            Store::Redis(r) => r.hgetall(key).await,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -161,6 +255,7 @@ pub struct RedisStore {
     conn: ConnectionManager,
     prefix: String,
     timeout: Duration,
+    slow_timeout: Duration,
     incr: Arc<Script>,
     incr_once: Arc<Script>,
 }
@@ -247,17 +342,194 @@ impl RedisStore {
         let _: String = self.bounded(async move { redis::cmd("PING").query_async(&mut conn).await }).await?;
         Ok(())
     }
+
+    async fn bounded_slow<T, F>(&self, fut: F) -> Result<T, StoreError>
+    where
+        F: Future<Output = redis::RedisResult<T>>,
+    {
+        match tokio::time::timeout(self.slow_timeout, fut).await {
+            Ok(r) => Ok(r?),
+            Err(_) => Err(StoreError::Timeout),
+        }
+    }
+
+    async fn list_push_capped(&self, key: &str, value: &str, max: usize) -> Result<(), StoreError> {
+        let mut conn = self.conn.clone();
+        let key = self.key(key);
+        let mut pipe = redis::pipe();
+        pipe.atomic()
+            .cmd("LPUSH")
+            .arg(&key)
+            .arg(value)
+            .ignore()
+            .cmd("LTRIM")
+            .arg(&key)
+            .arg(0)
+            .arg(max.max(1) as i64 - 1)
+            .ignore();
+        let _: () = self.bounded_slow(async move { pipe.query_async(&mut conn).await }).await?;
+        Ok(())
+    }
+
+    async fn list_range(&self, key: &str, limit: usize) -> Result<Vec<String>, StoreError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.conn.clone();
+        let key = self.key(key);
+        let end = limit as isize - 1;
+        let items: Vec<String> = self.bounded_slow(async move { conn.lrange(key, 0, end).await }).await?;
+        Ok(items)
+    }
+
+    async fn kv_set(&self, key: &str, value: &str, ttl_secs: u64) -> Result<(), StoreError> {
+        let mut conn = self.conn.clone();
+        let key = self.key(key);
+        let value = value.to_string();
+        let ttl = ttl_secs.max(1);
+        let _: () = self.bounded_slow(async move { conn.set_ex(key, value, ttl).await }).await?;
+        Ok(())
+    }
+
+    async fn kv_get(&self, key: &str) -> Result<Option<String>, StoreError> {
+        let mut conn = self.conn.clone();
+        let key = self.key(key);
+        let value: Option<String> = self.bounded_slow(async move { conn.get(key).await }).await?;
+        Ok(value)
+    }
+
+    async fn hincr_many(&self, key: &str, fields: &[(String, i64)], ttl_secs: u64) -> Result<(), StoreError> {
+        let mut conn = self.conn.clone();
+        let key = self.key(key);
+        let mut pipe = redis::pipe();
+        for (field, delta) in fields {
+            pipe.cmd("HINCRBY").arg(&key).arg(field).arg(*delta).ignore();
+        }
+        pipe.cmd("EXPIRE").arg(&key).arg(ttl_secs.max(1)).ignore();
+        let _: () = self.bounded_slow(async move { pipe.query_async(&mut conn).await }).await?;
+        Ok(())
+    }
+
+    async fn hgetall_many(&self, keys: &[String]) -> Result<Vec<HashMap<String, i64>>, StoreError> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut conn = self.conn.clone();
+        let mut pipe = redis::pipe();
+        for k in keys {
+            pipe.cmd("HGETALL").arg(self.key(k));
+        }
+        let out: Vec<HashMap<String, i64>> =
+            self.bounded_slow(async move { pipe.query_async(&mut conn).await }).await?;
+        Ok(out)
+    }
+
+    async fn hset(&self, key: &str, field: &str, value: &str) -> Result<(), StoreError> {
+        let mut conn = self.conn.clone();
+        let key = self.key(key);
+        let (field, value) = (field.to_string(), value.to_string());
+        let _: () = self.bounded_slow(async move { conn.hset(key, field, value).await }).await?;
+        Ok(())
+    }
+
+    async fn hdel(&self, key: &str, field: &str) -> Result<bool, StoreError> {
+        let mut conn = self.conn.clone();
+        let key = self.key(key);
+        let field = field.to_string();
+        let removed: i64 = self.bounded_slow(async move { conn.hdel(key, field).await }).await?;
+        Ok(removed > 0)
+    }
+
+    async fn hgetall(&self, key: &str) -> Result<HashMap<String, String>, StoreError> {
+        let mut conn = self.conn.clone();
+        let key = self.key(key);
+        let value: HashMap<String, String> =
+            self.bounded_slow(async move { conn.hgetall(key).await }).await?;
+        Ok(value)
+    }
 }
+
+/// Upper bound on expiring key/value entries (request details) kept in memory.
+const MEMORY_MAX_KV_ENTRIES: usize = 50_000;
+
+type CounterHash = (HashMap<String, i64>, Instant);
 
 pub struct MemoryStore {
     counters: DashMap<String, (u64, Instant)>,
     cache: DashMap<String, (Arc<Vec<u8>>, Instant)>,
     max_cache_entries: usize,
+    lists: DashMap<String, Mutex<VecDeque<String>>>,
+    kv: DashMap<String, (String, Instant)>,
+    counter_hashes: DashMap<String, CounterHash>,
+    hashes: DashMap<String, HashMap<String, String>>,
 }
 
 impl MemoryStore {
     fn new(max_cache_entries: usize) -> Self {
-        Self { counters: DashMap::new(), cache: DashMap::new(), max_cache_entries }
+        Self {
+            counters: DashMap::new(),
+            cache: DashMap::new(),
+            max_cache_entries,
+            lists: DashMap::new(),
+            kv: DashMap::new(),
+            counter_hashes: DashMap::new(),
+            hashes: DashMap::new(),
+        }
+    }
+
+    fn list_push_capped(&self, key: &str, value: &str, max: usize) {
+        let entry = self.lists.entry(key.to_owned()).or_default();
+        let mut list = entry.value().lock();
+        list.push_front(value.to_owned());
+        list.truncate(max.max(1));
+    }
+
+    fn list_range(&self, key: &str, limit: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some(l) = self.lists.get(key) {
+            out.extend(l.value().lock().iter().take(limit).cloned());
+        }
+        out
+    }
+
+    fn kv_set(&self, key: &str, value: &str, ttl_secs: u64) {
+        let now = Instant::now();
+        if self.kv.len() >= MEMORY_MAX_KV_ENTRIES && !self.kv.contains_key(key) {
+            self.kv.retain(|_, v| v.1 > now);
+            if self.kv.len() >= MEMORY_MAX_KV_ENTRIES {
+                return;
+            }
+        }
+        self.kv.insert(key.to_owned(), (value.to_owned(), now + Duration::from_secs(ttl_secs.max(1))));
+    }
+
+    fn kv_get(&self, key: &str) -> Option<String> {
+        match self.kv.get(key) {
+            Some(e) if e.value().1 > Instant::now() => Some(e.value().0.clone()),
+            _ => None,
+        }
+    }
+
+    fn hincr_many(&self, key: &str, fields: &[(String, i64)], ttl_secs: u64) {
+        let now = Instant::now();
+        let expires = now + Duration::from_secs(ttl_secs.max(1));
+        let mut entry =
+            self.counter_hashes.entry(key.to_owned()).or_insert_with(|| (HashMap::new(), expires));
+        let v = entry.value_mut();
+        if v.1 <= now {
+            v.0.clear();
+        }
+        v.1 = expires;
+        for (field, delta) in fields {
+            *v.0.entry(field.clone()).or_insert(0) += *delta;
+        }
+    }
+
+    fn hgetall_counters(&self, key: &str) -> HashMap<String, i64> {
+        match self.counter_hashes.get(key) {
+            Some(e) if e.value().1 > Instant::now() => e.value().0.clone(),
+            _ => HashMap::new(),
+        }
     }
 
     fn incr(&self, key: &str, delta: u64, ttl_secs: u64) -> u64 {
@@ -304,6 +576,8 @@ impl MemoryStore {
         let now = Instant::now();
         self.counters.retain(|_, v| v.1 > now);
         self.cache.retain(|_, v| v.1 > now);
+        self.kv.retain(|_, v| v.1 > now);
+        self.counter_hashes.retain(|_, v| v.1 > now);
     }
 }
 
@@ -324,5 +598,26 @@ mod tests {
         m.cache_set("k3", b"v3", 60); // over capacity: dropped, not evicting live entries
         assert_eq!(m.cache_get("k1").as_deref(), Some(&b"v1"[..]));
         assert_eq!(m.cache_get("k3"), None);
+    }
+
+    #[test]
+    fn memory_lists_hashes_and_kv() {
+        let m = MemoryStore::new(10);
+        for i in 0..5 {
+            m.list_push_capped("l", &i.to_string(), 3);
+        }
+        assert_eq!(m.list_range("l", 10), vec!["4", "3", "2"]);
+        assert_eq!(m.list_range("l", 1), vec!["4"]);
+
+        m.hincr_many("h", &[("a".into(), 2), ("b".into(), 1)], 60);
+        m.hincr_many("h", &[("a".into(), 3)], 60);
+        let h = m.hgetall_counters("h");
+        assert_eq!(h["a"], 5);
+        assert_eq!(h["b"], 1);
+        assert!(m.hgetall_counters("missing").is_empty());
+
+        m.kv_set("k", "v", 60);
+        assert_eq!(m.kv_get("k").as_deref(), Some("v"));
+        assert_eq!(m.kv_get("nope"), None);
     }
 }

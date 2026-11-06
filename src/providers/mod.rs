@@ -96,6 +96,37 @@ impl Provider {
         Ok(rb.headers(self.extra_headers.clone()))
     }
 
+    pub fn supports_embeddings(&self) -> bool {
+        self.cfg.kind != ProviderKind::Anthropic
+    }
+
+    /// Builds an upstream `/embeddings` request (OpenAI-compatible and Azure).
+    pub fn build_embeddings(&self, body: &Value, model: &str) -> Result<RequestBuilder, ApiError> {
+        let base = self.cfg.base_url.trim_end_matches('/');
+        let key = self.cfg.api_key.expose();
+        let mut b = body.clone();
+        if let Some(o) = b.as_object_mut() {
+            o.insert("model".into(), Value::String(model.to_string()));
+        }
+        let rb = match self.cfg.kind {
+            ProviderKind::Openai => self.client.post(format!("{base}/embeddings")).bearer_auth(key).json(&b),
+            ProviderKind::Azure => {
+                let version = self.cfg.api_version.as_deref().unwrap_or_default();
+                self.client
+                    .post(format!("{base}/{model}/embeddings?api-version={version}"))
+                    .header("api-key", Self::secret_header(key)?)
+                    .json(&b)
+            }
+            ProviderKind::Anthropic => {
+                return Err(ApiError::bad_request(format!(
+                    "provider '{}' does not support embeddings",
+                    self.name
+                )))
+            }
+        };
+        Ok(rb.headers(self.extra_headers.clone()))
+    }
+
     /// Converts a successful non-streaming upstream body to an OpenAI
     /// chat completion and extracts token usage.
     pub fn translate_response(&self, bytes: &[u8], model: &str) -> Result<(Vec<u8>, Usage), ApiError> {
