@@ -1,0 +1,46 @@
+# Local stack: two gateway replicas sharing one Redis, behind nginx.
+# Mirrors the production shape (replicas + shared state + load balancer).
+#
+#   cp config.example.yaml config.yaml   # then edit keys/providers
+#   export OPENAI_API_KEY=... ANTHROPIC_API_KEY=... REDIS_PASSWORD=...
+#   docker compose up --build
+#   curl localhost:8080/v1/chat/completions -H "Authorization: Bearer $GW_KEY" ...
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD}", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 5s
+      retries: 10
+
+  gateway-1: &gateway
+    build: .
+    environment:
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-unset}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-unset}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-unset}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-unset}
+      GROQ_API_KEY: ${GROQ_API_KEY:-unset}
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-unset}
+      RUST_LOG: info
+    volumes:
+      - ./config.yaml:/etc/ai-gateway/config.yaml:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    read_only: true
+    stop_grace_period: 150s   # > shutdown_drain_secs + shutdown_grace_secs + 10s usage flush
+
+  gateway-2:
+    <<: *gateway
+
+  lb:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./deploy/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "8080:8080"
+    depends_on: [gateway-1, gateway-2]

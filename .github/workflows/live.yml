@@ -1,0 +1,153 @@
+name: live
+# Builds the release binary and, when the OPENROUTER_API_KEY repo secret
+# exists, runs the gateway with Redis in front of the real OpenRouter API and
+# exercises it end to end.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s --health-timeout 2s --health-retries 15
+    env:
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      REDIS_URL: redis://127.0.0.1:6379/0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Check for the OpenRouter key
+        id: keys
+        run: echo "openrouter=$([ -n "$OPENROUTER_API_KEY" ] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
+
+      - name: Write config and client key
+        if: steps.keys.outputs.openrouter == 'yes'
+        run: |
+          KEY_OUT=$(./target/release/ai-gateway generate-key)
+          GW_KEY=$(echo "$KEY_OUT" | awk '/^api_key:/ {print $2}')
+          GW_HASH=$(echo "$KEY_OUT" | awk '/^key_sha256:/ {print $2}')
+          echo "::add-mask::$GW_KEY"
+          echo "GW_KEY=$GW_KEY" >> "$GITHUB_ENV"
+          cat > live.yaml <<YAML
+          server:
+            listen: 127.0.0.1:8080
+            admin_listen: 127.0.0.1:9090
+          store:
+            backend: redis
+            redis_url: \${REDIS_URL}
+          cache:
+            enabled: true
+          default_provider: openrouter
+          providers:
+            openrouter:
+              kind: openai
+              base_url: https://openrouter.ai/api/v1
+              api_key: \${OPENROUTER_API_KEY}
+            broken:
+              kind: openai
+              base_url: http://127.0.0.1:1/v1
+              api_key: not-used
+              max_retries: 1
+          routes:
+            - name: fallback
+              targets:
+                - provider: broken
+                  model: nothing
+                - provider: openrouter
+                  model: openai/gpt-4o-mini
+          keys:
+            - name: live-test
+              key_sha256: "$GW_HASH"
+              requests_per_minute: 20
+              allowed_models: ["fallback", "openrouter/*"]
+          YAML
+          ./target/release/ai-gateway check-config live.yaml
+
+      - name: Start gateway
+        if: steps.keys.outputs.openrouter == 'yes'
+        run: |
+          nohup ./target/release/ai-gateway serve live.yaml > gateway.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf localhost:8080/readyz && break; sleep 1; done
+          curl -sf localhost:8080/healthz
+
+      - name: A different model and provider on every request
+        if: steps.keys.outputs.openrouter == 'yes'
+        run: |
+          set -euo pipefail
+          H=(-H "Authorization: Bearer $GW_KEY" -H "Content-Type: application/json")
+          for model in openai/gpt-4o-mini anthropic/claude-haiku-4.5 google/gemini-2.5-flash; do
+            curl -sS --fail-with-body localhost:8080/v1/chat/completions "${H[@]}" -D h.txt -o b.json \
+              -d "{\"model\":\"$model\",\"max_tokens\":20,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with just: pong\"}]}" \
+              || { cat b.json; exit 1; }
+            grep -i "x-gateway-provider: openrouter" h.txt
+            grep -i "x-gateway-model: $model" h.txt
+            jq -e '.usage.total_tokens > 0' b.json >/dev/null
+            echo "$model -> $(jq -r '.choices[0].message.content' b.json) (cost \$$(jq -r '.usage.cost // "n/a"' b.json))"
+          done
+
+      - name: Streaming and tool calling
+        if: steps.keys.outputs.openrouter == 'yes'
+        run: |
+          set -euo pipefail
+          H=(-H "Authorization: Bearer $GW_KEY" -H "Content-Type: application/json")
+          curl -sSN --fail-with-body localhost:8080/v1/chat/completions "${H[@]}" -o s.txt \
+            -d '{"model":"anthropic/claude-haiku-4.5","stream":true,"max_tokens":40,"messages":[{"role":"user","content":"Count 1 to 5"}]}' \
+            || { cat s.txt; exit 1; }
+          grep -q '"chat.completion.chunk"' s.txt
+          grep -q 'data: \[DONE\]' s.txt
+          echo "streamed: $(grep -o '"content":"[^"]*"' s.txt | cut -d'"' -f4 | tr -d '\n')"
+
+          curl -sS --fail-with-body localhost:8080/v1/chat/completions "${H[@]}" -o t.json \
+            -d '{"model":"openai/gpt-4o-mini","tool_choice":"required","messages":[{"role":"user","content":"What is the weather in Pune?"}],
+                 "tools":[{"type":"function","function":{"name":"get_weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]}' \
+            || { cat t.json; exit 1; }
+          jq -e '.choices[0].message.tool_calls[0].function.name == "get_weather"' t.json
+          jq -r '.choices[0].message.tool_calls[0].function.arguments' t.json | jq -e '.city | length > 0'
+
+      - name: Fallback, cache, auth, rate limit, metrics
+        if: steps.keys.outputs.openrouter == 'yes'
+        run: |
+          set -euo pipefail
+          H=(-H "Authorization: Bearer $GW_KEY" -H "Content-Type: application/json")
+          REQ='{"model":"fallback","max_tokens":5,"messages":[{"role":"user","content":"Reply with just: ok"}]}'
+
+          # Fallback: the first target is down, OpenRouter must answer.
+          curl -sS --fail-with-body localhost:8080/v1/chat/completions "${H[@]}" -D h.txt -o b.json -d "$REQ" \
+            || { cat b.json; exit 1; }
+          grep -i "x-gateway-provider: openrouter" h.txt
+
+          # Cache: the identical request is served without calling OpenRouter.
+          curl -sf localhost:8080/v1/chat/completions "${H[@]}" -D h2.txt -o /dev/null -d "$REQ"
+          grep -i "x-gateway-cache: HIT" h2.txt
+
+          # Bad key -> 401.
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/v1/chat/completions \
+            -H 'Authorization: Bearer wrong' -d '{}')" = "401"
+
+          # Rate limit (20/min): tiny uncached requests until a 429 arrives.
+          got429=no
+          for i in $(seq 1 25); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/v1/chat/completions "${H[@]}" \
+              -H 'x-gateway-cache: skip' -d "$REQ")
+            [ "$code" = "429" ] && got429=yes && break
+          done
+          echo "rate limited: $got429"; [ "$got429" = yes ]
+
+          # Metrics: requests, tokens and the cost OpenRouter reported.
+          curl -sf localhost:9090/metrics | grep -E '^gateway_(requests_total|tokens_total|cost_microdollars_total)'
+          curl -sf localhost:9090/metrics | grep -q '^gateway_tokens_total'
+
+      - name: Gateway log
+        if: always() && steps.keys.outputs.openrouter == 'yes'
+        run: cat gateway.log || true

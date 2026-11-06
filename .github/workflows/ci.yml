@@ -1,0 +1,69 @@
+name: ci
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 2s --health-timeout 2s --health-retries 15
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
+      - name: Lint
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Unit and end-to-end tests (in-memory store)
+        run: cargo test
+      - name: End-to-end tests against real Redis
+        env:
+          AIGW_TEST_REDIS_URL: redis://127.0.0.1:6379/0
+        run: cargo test -- --test-threads=4
+      - name: Release build
+        run: cargo build --release
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t ai-gateway:ci .
+      - name: Smoke test the image
+        run: |
+          docker run --rm ai-gateway:ci --help
+          cat > /tmp/config.yaml <<'YAML'
+          server:
+            listen: 0.0.0.0:8080
+            admin_listen: 0.0.0.0:9090
+          providers:
+            mock:
+              kind: openai
+              base_url: http://127.0.0.1:1/v1
+              api_key: not-used
+          keys:
+            - name: smoke
+              key_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+              allowed_models: ["*"]
+          YAML
+          docker run -d --name gw -p 8080:8080 -p 9090:9090 \
+            -v /tmp/config.yaml:/etc/ai-gateway/config.yaml:ro ai-gateway:ci
+          for i in $(seq 1 30); do curl -sf localhost:8080/readyz && break; sleep 1; done
+          curl -sf localhost:8080/healthz
+          curl -sf localhost:9090/metrics | grep -q gateway_circuit_open
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST localhost:8080/v1/chat/completions)" = "401"
+          docker logs gw
+          docker rm -f gw
