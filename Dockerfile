@@ -6,6 +6,7 @@ COPY Cargo.toml Cargo.lock* ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs \
     && cargo build --release || true
 COPY src ./src
+COPY dashboard ./dashboard
 RUN touch src/main.rs src/lib.rs && cargo build --release
 
 # Distroless: no shell, no package manager, runs as an unprivileged user.
