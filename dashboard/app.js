@@ -33,7 +33,7 @@
       else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
       else n.setAttribute(k, v === true ? "" : String(v));
     }
-    for (const c of children.flat()) {
+    for (const c of children.flat(Infinity)) {
       if (c === null || c === undefined || c === false) continue;
       n.append(c instanceof Node ? c : document.createTextNode(String(c)));
     }
@@ -188,8 +188,6 @@
   function drawChart(canvas, data, series, opts) {
     const height = opts.height || 180;
     const { ctx, w, h } = setupCanvas(canvas, height);
-    const pad = { l: 46, r: 8, t: 8, b: 22 };
-    const iw = w - pad.l - pad.r, ih = h - pad.t - pad.b;
     const stacked = opts.kind === "bars";
     const totals = data.map((d) => stacked
       ? series.reduce((a, s) => a + (d[s.key] || 0), 0)
@@ -198,6 +196,10 @@
     const fmt = opts.format || compact;
     ctx.clearRect(0, 0, w, h);
     ctx.font = "11px system-ui, sans-serif";
+    let labelW = 0;
+    for (let i = 0; i <= 4; i++) labelW = Math.max(labelW, ctx.measureText(fmt((max * i) / 4)).width);
+    const pad = { l: Math.ceil(labelW) + 12, r: 8, t: 8, b: 22 };
+    const iw = w - pad.l - pad.r, ih = h - pad.t - pad.b;
     ctx.fillStyle = cssVar("--muted");
     ctx.strokeStyle = cssVar("--rule");
     ctx.lineWidth = 1;
@@ -316,7 +318,7 @@
       breakdownPanel("Status codes", d.statuses, [], t.requests));
 
     const tables = el("div", { class: "grid2" },
-      breakdownPanel("Models", d.models, [["Tokens", "tokens", compact], ["Spend", "cost_usd", usd], ["Failed", "errors", num]], t.requests),
+      breakdownPanel("Models", d.models, [["Tokens", "tokens", compact], ["Spend", "cost_usd", usd], ["Failed", "errors", num]], t.requests, true),
       breakdownPanel("API keys", d.keys, [["Tokens", "tokens", compact], ["Spend", "cost_usd", usd]], t.requests),
       breakdownPanel("Providers", d.providers.map((p) => ({ ...p, avg: p.requests ? Math.round(p.latency_sum_ms / p.requests) : 0 })),
         [["Failed", "errors", num], ["Avg latency", "avg", ms]], t.requests));
@@ -332,10 +334,11 @@
       el("div", { class: "k", text: label }), el("div", { class: "v", text: value }), el("div", { class: "d", text: detail }));
   }
 
-  function breakdownPanel(title, rows, cols, total) {
-    if (!rows.length) return el("section", { class: "panel" }, el("h2", { text: title }), el("div", { class: "empty", text: "Nothing yet." }));
+  function breakdownPanel(title, rows, cols, total, wide) {
+    const cls = wide ? " wide" : "";
+    if (!rows.length) return el("section", { class: "panel" + cls }, el("h2", { text: title }), el("div", { class: "empty", text: "Nothing yet." }));
     const max = Math.max(...rows.map((r) => r.requests));
-    return el("section", { class: "panel flush" }, el("h2", { text: title }),
+    return el("section", { class: "panel flush" + cls }, el("h2", { text: title }),
       el("div", { class: "table-wrap" }, el("table", {},
         el("thead", {}, el("tr", {}, el("th", { text: "Name" }), el("th", { class: "num", text: "Requests" }),
           cols.map(([label]) => el("th", { class: "num", text: label })))),
@@ -449,7 +452,7 @@
     const more = state.logs.rows.length < state.logs.total
       ? el("div", { class: "actions" }, el("button", { class: "btn", type: "button", text: "Show more", onclick: () => loadLogs(true) }))
       : null;
-    host.replaceChildren(el("section", { class: "panel flush" }, el("div", { class: "table-wrap" }, table)), more);
+    host.replaceChildren(...[el("section", { class: "panel flush" }, el("div", { class: "table-wrap" }, table)), more].filter(Boolean));
   }
 
   function prettyBody(text) {
