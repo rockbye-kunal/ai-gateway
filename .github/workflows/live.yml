@@ -4,6 +4,8 @@ name: live
 # against the real providers with Redis and exercises it end to end.
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
 
 jobs:
   live:
