@@ -686,13 +686,16 @@
     })[p.key];
     const provRow = (p) => {
       const h = health[p.name];
-      const status = !p.ready ? el("span", { class: "pill", text: "Needs a key" })
+      const status = p.error ? el("span", { class: "pill err", title: p.error, text: "Not applied" })
+        : !p.ready ? el("span", { class: "pill", text: "Needs a key" })
         : h && h.circuit_open ? el("span", { class: "pill err", text: "Circuit open" })
         : el("span", { class: "pill ok", text: "Ready" });
       return el("tr", {},
         el("td", {}, el("div", {}, el("strong", { text: p.name }), p.default ? el("span", { class: "pill", style: "margin-left:6px", text: "Default" }) : null),
           p.label ? el("div", { class: "sub", text: p.label }) : null),
-        el("td", {}, el("div", { text: KIND_LABEL[p.kind] || p.kind }), el("div", { class: "sub trunc", title: p.base_url, text: p.base_url })),
+        el("td", {}, el("div", { text: KIND_LABEL[p.kind] || p.kind || "–" }),
+          p.error ? el("div", { class: "sub", style: "color:var(--error)", text: p.error })
+            : el("div", { class: "sub trunc", title: p.base_url, text: p.base_url })),
         el("td", { text: keyText(p) }),
         el("td", {}, status),
         el("td", { text: SOURCE_LABEL[p.source] || p.source }),
@@ -707,8 +710,8 @@
     const provTable = (rows) => el("table", {},
       el("thead", {}, el("tr", {}, ["Provider", "Type and endpoint", "Key", "Status", "Defined in", ""].map((h) => el("th", { text: h })))),
       el("tbody", {}, rows.map(provRow)));
-    const ready = provs.data.filter((p) => p.ready);
-    const waiting = provs.data.filter((p) => !p.ready);
+    const ready = provs.data.filter((p) => p.ready || p.error);
+    const waiting = provs.data.filter((p) => !p.ready && !p.error);
     const providersPanel = el("section", { class: "panel flush" },
       el("div", { class: "page-head", style: "padding:12px 16px 0;margin:0" },
         el("div", {}, el("h2", { style: "padding:0", text: "Providers" }),
@@ -753,12 +756,12 @@
     const routes = routesRes.data.length ? el("table", {},
       el("thead", {}, el("tr", {}, ["Route", "Strategy", "Targets, in fallback order", "Defined in", ""].map((h) => el("th", { text: h })))),
       el("tbody", {}, routesRes.data.map((r) => el("tr", {},
-        el("td", { text: r.name }),
-        el("td", { text: (STRATEGY_LABEL[r.strategy] || r.strategy) + (r.branches.length ? ", " + r.branches.length + " conditional branch" + (r.branches.length > 1 ? "es" : "") : "") }),
-        el("td", { class: "trunc", text: r.targets.map((t) => t.provider + "/" + t.model + (r.strategy === "weighted" ? " (" + (t.weight === undefined ? 1 : t.weight) + ")" : "")).join("  ›  ") }),
+        el("td", {}, el("div", { text: r.name }), r.error ? el("div", { class: "sub", style: "color:var(--error)", text: "Not applied: " + r.error }) : null),
+        el("td", { text: (STRATEGY_LABEL[r.strategy] || r.strategy || "In order") + ((r.branches || []).length ? ", " + r.branches.length + " conditional branch" + (r.branches.length > 1 ? "es" : "") : "") }),
+        el("td", { class: "trunc", text: (r.targets || []).map((t) => t.provider + "/" + t.model + (r.strategy === "weighted" ? " (" + (t.weight === undefined ? 1 : t.weight) + ")" : "")).join("  ›  ") }),
         el("td", { text: SOURCE_LABEL[r.source] }),
         el("td", { class: "actions-cell" }, r.source === "dashboard" ? [
-          el("button", { class: "btn", type: "button", text: "Edit", onclick: () => openRouteForm(provs.data, r) }), " ",
+          r.error ? null : el("button", { class: "btn", type: "button", text: "Edit", onclick: () => openRouteForm(provs.data, r) }), " ",
           el("button", { class: "btn danger", type: "button", text: "Delete", onclick: () => removeRoute(r.name) }),
         ] : null)))))
       : el("div", { class: "empty", text: "No routes. Clients call provider/model directly." });

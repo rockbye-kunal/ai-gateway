@@ -293,7 +293,7 @@ pub async fn list_models(
             }));
         }
     }
-    for list in app.catalog.lists(&app, false).await {
+    for list in crate::catalog::Catalog::lists(&app, false).await {
         if q.provider.as_deref().is_some_and(|p| p != list.provider) {
             continue;
         }

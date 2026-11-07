@@ -78,34 +78,63 @@ pub struct DynamicRaw {
     pub routes: BTreeMap<String, String>,
 }
 
-impl DynamicRaw {
-    /// Parses the stored JSON. Entries that no longer parse are skipped.
-    pub fn parse(&self) -> (BTreeMap<String, ProviderConfig>, BTreeMap<String, RouteConfig>) {
-        let providers = self
-            .providers
-            .iter()
-            .filter_map(|(name, v)| match serde_json::from_str::<ProviderConfig>(v) {
-                Ok(p) => Some((name.clone(), p)),
-                Err(e) => {
-                    tracing::warn!(provider = %name, error = %e, "ignoring an unreadable dashboard provider");
-                    None
+/// Entries that could not be used, keyed `provider:<name>` or `route:<name>`,
+/// with the reason.
+pub type DynamicErrors = BTreeMap<String, String>;
+
+/// Merges dashboard providers and routes into `base` one entry at a time, so
+/// an entry that doesn't fit (say, a route whose provider was removed from the
+/// config file) is skipped and reported instead of blocking the others.
+pub fn merge_dynamic(base: &Config, raw: &DynamicRaw) -> (Config, DynamicErrors) {
+    let mut errors = DynamicErrors::new();
+    let mut providers: BTreeMap<String, ProviderConfig> = BTreeMap::new();
+    for (name, v) in &raw.providers {
+        match serde_json::from_str::<ProviderConfig>(v) {
+            Ok(p) => {
+                let mut trial = providers.clone();
+                trial.insert(name.clone(), p.clone());
+                match base.with_dynamic(&trial, &BTreeMap::new()) {
+                    Ok(_) => {
+                        providers.insert(name.clone(), p);
+                    }
+                    Err(e) => {
+                        errors.insert(format!("provider:{name}"), format!("{e:#}"));
+                    }
                 }
-            })
-            .collect();
-        let routes = self
-            .routes
-            .iter()
-            .filter_map(|(name, v)| match serde_json::from_str::<RouteConfig>(v) {
-                Ok(r) if r.name == *name => Some((name.clone(), r)),
-                Ok(_) => None,
-                Err(e) => {
-                    tracing::warn!(route = %name, error = %e, "ignoring an unreadable dashboard route");
-                    None
-                }
-            })
-            .collect();
-        (providers, routes)
+            }
+            Err(e) => {
+                errors.insert(format!("provider:{name}"), format!("unreadable definition: {e}"));
+            }
+        }
     }
+    let mut routes: BTreeMap<String, RouteConfig> = BTreeMap::new();
+    for (name, v) in &raw.routes {
+        match serde_json::from_str::<RouteConfig>(v) {
+            Ok(r) if r.name == *name => {
+                let mut trial = routes.clone();
+                trial.insert(name.clone(), r.clone());
+                match base.with_dynamic(&providers, &trial) {
+                    Ok(_) => {
+                        routes.insert(name.clone(), r);
+                    }
+                    Err(e) => {
+                        errors.insert(format!("route:{name}"), format!("{e:#}"));
+                    }
+                }
+            }
+            Ok(_) => {
+                errors.insert(format!("route:{name}"), "the stored route has a different name".into());
+            }
+            Err(e) => {
+                errors.insert(format!("route:{name}"), format!("unreadable definition: {e}"));
+            }
+        }
+    }
+    let cfg = base.with_dynamic(&providers, &routes).unwrap_or_else(|_| base.clone());
+    for (key, why) in &errors {
+        tracing::warn!(entry = %key, error = %why, "skipping a provider or route from the dashboard");
+    }
+    (cfg, errors)
 }
 
 pub struct AppState {
@@ -113,8 +142,13 @@ pub struct AppState {
     /// The configuration from the file (or test), before dashboard providers
     /// and routes are merged in.
     base_cfg: RwLock<Arc<Config>>,
-    /// Dashboard providers and routes currently applied.
+    /// Dashboard providers and routes as last read from the store.
     dynamic: RwLock<DynamicRaw>,
+    /// Which of them could not be used, and why.
+    dynamic_errors: RwLock<DynamicErrors>,
+    /// Held while the runtime is rebuilt (reload or dashboard change), so two
+    /// rebuilds never overwrite each other.
+    rebuild: parking_lot::Mutex<()>,
     /// Live model lists fetched from providers.
     pub catalog: crate::catalog::Catalog,
     /// Config file to re-read on reload (none in tests).
@@ -152,27 +186,28 @@ impl AppState {
         self.dynamic.read().clone()
     }
 
-    /// Checks that dashboard providers and routes would make a valid
-    /// configuration, without applying them.
-    pub fn check_dynamic(&self, raw: &DynamicRaw) -> anyhow::Result<Config> {
-        let (providers, routes) = raw.parse();
-        if providers.len() != raw.providers.len() || routes.len() != raw.routes.len() {
-            anyhow::bail!("a provider or route definition is not valid");
-        }
-        self.base_cfg().with_dynamic(&providers, &routes)
+    pub fn dynamic_errors(&self) -> DynamicErrors {
+        self.dynamic_errors.read().clone()
     }
 
-    /// Applies dashboard providers and routes if they changed. Invalid ones
-    /// leave the running settings as they are.
+    /// What applying `raw` would reject, without applying it.
+    pub fn check_dynamic(&self, raw: &DynamicRaw) -> DynamicErrors {
+        merge_dynamic(&self.base_cfg(), raw).1
+    }
+
+    /// Applies dashboard providers and routes if they changed. Entries that
+    /// don't fit are skipped (see `dynamic_errors`); the rest apply.
     pub fn apply_dynamic(&self, raw: DynamicRaw) -> anyhow::Result<()> {
+        let _guard = self.rebuild.lock();
         if *self.dynamic.read() == raw {
             return Ok(());
         }
-        let cfg = self.check_dynamic(&raw)?;
+        let (cfg, errors) = merge_dynamic(&self.base_cfg(), &raw);
         let old = self.rt();
         let rt = Runtime::build(cfg, &self.http, Some(&old))?;
         *self.rt.write() = Arc::new(rt);
         *self.dynamic.write() = raw;
+        *self.dynamic_errors.write() = errors;
         tracing::info!("providers and routes from the dashboard applied");
         Ok(())
     }
@@ -217,6 +252,8 @@ impl AppState {
             config_path: RwLock::new(None),
             base_cfg: RwLock::new(Arc::new(cfg.clone())),
             dynamic: RwLock::new(DynamicRaw::default()),
+            dynamic_errors: RwLock::new(DynamicErrors::new()),
+            rebuild: parking_lot::Mutex::new(()),
             catalog: Default::default(),
             rt: RwLock::new(Arc::new(Runtime::build(cfg, &client, None)?)),
             http: client,
@@ -282,22 +319,17 @@ impl AppState {
         {
             notes.push("log export and OpenTelemetry settings change only on restart".into());
         }
-        let base = cfg.clone();
-        let (providers, routes) = self.dynamic().parse();
-        let effective = match cfg.with_dynamic(&providers, &routes) {
-            Ok(c) => c,
-            Err(e) => {
-                notes.push(format!(
-                    "providers and routes added in the dashboard no longer fit this config and are paused: {e:#}"
-                ));
-                cfg
-            }
-        };
-        let rt = Runtime::build(effective, &self.http, Some(&old))?;
+        let _guard = self.rebuild.lock();
+        let (effective, errors) = merge_dynamic(&cfg, &self.dynamic());
+        for (key, why) in &errors {
+            notes.push(format!("dashboard {key} is skipped: {why}"));
+        }
+        let rt = Runtime::build(effective, &self.http, Some(&self.rt()))?;
         self.keys.set_config(&rt.cfg.keys);
         self.rules.set_config(&rt.cfg.routing_rules);
-        *self.base_cfg.write() = Arc::new(base);
+        *self.base_cfg.write() = Arc::new(cfg);
         *self.rt.write() = Arc::new(rt);
+        *self.dynamic_errors.write() = errors;
         metrics::counter!("gateway_config_reloads_total").increment(1);
         tracing::info!(path = %path, "configuration reloaded");
         Ok(notes)

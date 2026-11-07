@@ -127,6 +127,17 @@ fn provider(v: serde_json::Value) -> ProviderConfig {
     p
 }
 
+/// An endpoint from the environment the gateway will use: https, or plain
+/// http to this machine, with no credentials, query or fragment.
+fn usable_url(url: &str) -> bool {
+    let local = ["http://localhost", "http://127.0.0.1", "http://[::1]"]
+        .iter()
+        .any(|p| url.strip_prefix(p).is_some_and(|rest| rest.is_empty() || rest.starts_with([':', '/'])));
+    (url.starts_with("https://") || local)
+        && !url.contains(['@', '?', '#'])
+        && !url.contains(char::is_whitespace)
+}
+
 /// Built-in providers, given a way to read environment variables.
 pub fn providers(env: &dyn Fn(&str) -> Option<String>) -> Vec<(String, ProviderConfig)> {
     let get = |k: &str| env(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
@@ -134,7 +145,18 @@ pub fn providers(env: &dyn Fn(&str) -> Option<String>) -> Vec<(String, ProviderC
     for b in BUILTINS {
         let key = b.key_env.iter().find_map(|k| get(k)).unwrap_or_default();
         let base_env = format!("{}_BASE_URL", b.name.to_ascii_uppercase());
-        let base = get(&base_env).unwrap_or_else(|| b.base_url.to_string());
+        let base = match get(&base_env) {
+            // SDKs read some of these variables too (OPENAI_BASE_URL), so a
+            // value the gateway can't use is ignored, together with the
+            // built-in provider: falling back to the public endpoint could
+            // send a key meant for that URL somewhere else.
+            Some(url) if !usable_url(&url) => {
+                tracing::warn!(variable = %base_env, "ignoring built-in provider '{}': {base_env} must be https, or http to localhost", b.name);
+                continue;
+            }
+            Some(url) => url,
+            None => b.base_url.to_string(),
+        };
         out.push((b.name.to_string(), provider(json!({"kind": b.kind, "base_url": base, "api_key": key}))));
     }
 
@@ -198,6 +220,22 @@ mod tests {
         assert!(all.iter().all(|(_, p)| p.source == ProviderSource::Builtin));
         assert!(!all.iter().any(|(n, _)| n == "bedrock" || n == "vertex"));
         assert_eq!(all.len(), BUILTINS.len());
+    }
+
+    #[test]
+    fn unusable_base_urls_drop_the_provider() {
+        let all = providers(&env(&[
+            ("OPENAI_API_KEY", "sk"),
+            ("OPENAI_BASE_URL", "http://litellm:4000/v1"),
+            ("GROQ_BASE_URL", "https://user:pw@groq.example/v1"),
+            ("MISTRAL_BASE_URL", "http://localhost:8000/v1"),
+        ]));
+        let names: Vec<&str> = all.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(!names.contains(&"openai"), "plain http to another host is not used");
+        assert!(!names.contains(&"groq"), "credentials in the URL are not used");
+        assert!(names.contains(&"mistral"), "http to localhost is fine");
+        assert!(usable_url("https://api.example.com/v1"));
+        assert!(!usable_url("http://localhost.evil.com/v1"));
     }
 
     #[test]

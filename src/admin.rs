@@ -677,6 +677,31 @@ pub async fn delete_provider_key(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Dashboard providers and routes as stored now (not the copy in memory,
+/// which another replica may have changed since the last refresh).
+async fn stored_dynamic(app: &AppState) -> Result<crate::app::DynamicRaw, ApiError> {
+    Ok(crate::app::DynamicRaw {
+        providers: app
+            .store
+            .hgetall(STORED_PROVIDERS)
+            .await
+            .map_err(store_unavailable)?
+            .into_iter()
+            .collect(),
+        routes: app.store.hgetall(STORED_ROUTES).await.map_err(store_unavailable)?.into_iter().collect(),
+    })
+}
+
+/// Re-reads the store and applies it; fails if `entry` (`provider:x` or
+/// `route:x`) ended up skipped.
+async fn apply_and_check(app: &AppState, entry: &str) -> Result<(), ApiError> {
+    refresh_dynamic(app).await.map_err(store_unavailable)?;
+    match app.dynamic_errors().get(entry) {
+        Some(why) => Err(ApiError::bad_request(why.clone())),
+        None => Ok(()),
+    }
+}
+
 /// Every provider the gateway knows: from the config file, built in, or
 /// added in the dashboard, with whether it has a key.
 pub async fn list_providers(
@@ -715,6 +740,16 @@ pub async fn list_providers(
             })
         })
         .collect();
+    // Dashboard providers that couldn't be applied, so they can be fixed or
+    // removed.
+    for (entry, why) in app.dynamic_errors() {
+        if let Some(name) = entry.strip_prefix("provider:") {
+            data.retain(|p| p["name"] != name || p["source"] != "builtin");
+            data.push(
+                json!({"name": name, "source": "dashboard", "ready": false, "key": "none", "error": why}),
+            );
+        }
+    }
     data.sort_by(|a, b| {
         (!a["ready"].as_bool().unwrap_or(false), a["name"].as_str())
             .cmp(&(!b["ready"].as_bool().unwrap_or(false), b["name"].as_str()))
@@ -773,6 +808,14 @@ pub async fn put_provider(
             format!("provider '{name}' is defined in the config file; change it there"),
         ));
     }
+    let cloud = matches!(b.kind, ProviderKind::Bedrock | ProviderKind::Vertex);
+    if cloud && b.base_url.as_deref().is_some_and(|u| !u.trim().is_empty()) {
+        // They sign with the gateway's own AWS or Google credentials, which
+        // must only go to AWS or Google; the endpoint comes from the region.
+        return Err(ApiError::bad_request(
+            "Bedrock and Vertex endpoints come from the region; base_url can't be set for them here",
+        ));
+    }
     let key = b.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty());
     if let Some(k) = key {
         if k.len() > 1024 || axum::http::HeaderValue::from_str(k).is_err() {
@@ -810,18 +853,36 @@ pub async fn put_provider(
     opt(&mut def, "no_prompt_training", b.no_prompt_training.map(Value::from));
     opt(&mut def, "auto_prompt_cache", b.auto_prompt_cache.map(Value::from));
     opt(&mut def, "allow_insecure_http", b.allow_insecure_http.map(Value::from));
+    // A key already in use for this name (stored, or from the environment)
+    // must not follow the provider to a different endpoint.
+    if key.is_none() {
+        if let Some(current) = app.rt().providers.get(&name) {
+            let has_key = !current.cfg.api_key.expose().is_empty()
+                || app.stored_provider_keys.read().contains_key(&name);
+            let new_url = def.get("base_url").and_then(Value::as_str).unwrap_or("");
+            let moved = current.cfg.kind != b.kind
+                || current.cfg.base_url.trim_end_matches('/') != new_url.trim_end_matches('/');
+            if has_key && moved && !cloud {
+                return Err(ApiError::bad_request(format!(
+                    "'{name}' has an API key for its current endpoint; send api_key for the new endpoint too"
+                )));
+            }
+        }
+    }
     let def = Value::Object(def).to_string();
 
-    let mut raw = app.dynamic();
+    let mut raw = stored_dynamic(&app).await?;
     raw.providers.insert(name.clone(), def.clone());
-    app.check_dynamic(&raw).map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    if let Some(why) = app.check_dynamic(&raw).get(&format!("provider:{name}")) {
+        return Err(ApiError::bad_request(why.clone()));
+    }
 
     if let (Some(k), Some(cipher)) = (key, &app.cipher) {
         let enc = cipher.encrypt(k).map_err(|_| ApiError::internal_config("encryption failed"))?;
         app.store.hset(PROVIDER_KEYS, &name, &enc).await.map_err(store_unavailable)?;
     }
     app.store.hset(STORED_PROVIDERS, &name, &def).await.map_err(store_unavailable)?;
-    refresh_dynamic(&app).await.map_err(store_unavailable)?;
+    apply_and_check(&app, &format!("provider:{name}")).await?;
     audit(&app, "provider.set", &name, json!({"kind": b.kind, "key": key.map(hint)})).await;
     let ready = app.rt().providers.get(&name).is_some_and(|p| crate::proxy::provider_ready(&app, p, None));
     Ok(Json(json!({"name": name, "ready": ready})))
@@ -835,13 +896,35 @@ pub async fn delete_provider(
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     authorize(&app, &headers)?;
-    let mut raw = app.dynamic();
-    if raw.providers.remove(&name).is_none() {
+    let raw = stored_dynamic(&app).await?;
+    if !raw.providers.contains_key(&name) {
         return Err(not_found(
             "dashboard provider (config-file and built-in providers can't be removed here)",
         ));
     }
-    app.check_dynamic(&raw).map_err(|e| conflict("in_use", format!("can't remove '{name}': {e:#}")))?;
+    // Refuse while a dashboard route still sends traffic to it (unless a
+    // built-in provider of the same name would take over).
+    if !app.base_cfg().providers.contains_key(&name) {
+        let users: Vec<String> = raw
+            .routes
+            .iter()
+            .filter(|(_, v)| {
+                serde_json::from_str::<RouteConfig>(v).is_ok_and(|r| {
+                    r.targets
+                        .iter()
+                        .chain(r.branches.iter().flat_map(|b| b.targets.iter()))
+                        .any(|t| t.provider == name)
+                })
+            })
+            .map(|(n, _)| n.clone())
+            .collect();
+        if !users.is_empty() {
+            return Err(conflict(
+                "in_use",
+                format!("'{name}' is used by the route(s) {}; change or delete them first", users.join(", ")),
+            ));
+        }
+    }
     app.store.hdel(STORED_PROVIDERS, &name).await.map_err(store_unavailable)?;
     if !app.base_cfg().providers.contains_key(&name) {
         app.store.hdel(PROVIDER_KEYS, &name).await.map_err(store_unavailable)?;
@@ -871,6 +954,21 @@ pub async fn list_routes(
             v
         })
         .collect();
+    let raw = app.dynamic();
+    for (entry, why) in app.dynamic_errors() {
+        if let Some(name) = entry.strip_prefix("route:") {
+            let mut v = raw
+                .routes
+                .get(name)
+                .and_then(|r| serde_json::from_str::<Value>(r).ok())
+                .filter(Value::is_object)
+                .unwrap_or_else(|| json!({"targets": [], "branches": []}));
+            v["name"] = json!(name);
+            v["source"] = json!("dashboard");
+            v["error"] = json!(why);
+            data.push(v);
+        }
+    }
     data.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     Ok(Json(json!({ "data": data })))
 }
@@ -901,11 +999,13 @@ pub async fn put_route(
         serde_json::from_value(body).map_err(|e| ApiError::bad_request(format!("invalid route: {e}")))?;
     let def =
         serde_json::to_string(&route).map_err(|_| ApiError::internal_config("route encoding failed"))?;
-    let mut raw = app.dynamic();
+    let mut raw = stored_dynamic(&app).await?;
     raw.routes.insert(name.clone(), def.clone());
-    app.check_dynamic(&raw).map_err(|e| ApiError::bad_request(format!("{e:#}")))?;
+    if let Some(why) = app.check_dynamic(&raw).get(&format!("route:{name}")) {
+        return Err(ApiError::bad_request(why.clone()));
+    }
     app.store.hset(STORED_ROUTES, &name, &def).await.map_err(store_unavailable)?;
-    refresh_dynamic(&app).await.map_err(store_unavailable)?;
+    apply_and_check(&app, &format!("route:{name}")).await?;
     audit(&app, "route.set", &name, json!({"targets": route.targets.len()})).await;
     Ok(Json(serde_json::to_value(&route).unwrap_or_default()))
 }
@@ -916,11 +1016,9 @@ pub async fn delete_route(
     Path(name): Path<String>,
 ) -> Result<StatusCode, ApiError> {
     authorize(&app, &headers)?;
-    let mut raw = app.dynamic();
-    if raw.routes.remove(&name).is_none() {
+    if !app.store.hdel(STORED_ROUTES, &name).await.map_err(store_unavailable)? {
         return Err(not_found("dashboard route (routes from the config file are removed there)"));
     }
-    app.store.hdel(STORED_ROUTES, &name).await.map_err(store_unavailable)?;
     refresh_dynamic(&app).await.map_err(store_unavailable)?;
     audit(&app, "route.delete", &name, json!({})).await;
     Ok(StatusCode::NO_CONTENT)
@@ -954,8 +1052,8 @@ pub async fn refresh_models(
     Ok(Json(v))
 }
 
-async fn catalog_json(app: &AppState, force: bool) -> Value {
-    let lists = app.catalog.lists(app, force).await;
+async fn catalog_json(app: &Arc<AppState>, force: bool) -> Value {
+    let lists = crate::catalog::Catalog::lists(app, force).await;
     let rt = app.rt();
     let providers: Vec<Value> = lists
         .iter()
