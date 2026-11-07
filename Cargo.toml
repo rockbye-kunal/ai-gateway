@@ -30,7 +30,7 @@ dashmap = "6"
 futures = "0.3"
 hex = "0.4"
 hmac = "0.12"
-metrics = "0.23"
+metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.15", default-features = false }
 parking_lot = "0.12"
 rand = "0.8"

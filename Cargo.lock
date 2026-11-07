@@ -71,7 +71,7 @@ dependencies = [
  "futures",
  "hex",
  "hmac",
- "metrics",
+ "metrics 0.24.6",
  "metrics-exporter-prometheus",
  "parking_lot",
  "rand 0.8.8",
@@ -1005,6 +1005,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "metrics"
+version = "0.24.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89550ee9f79e88fef3119de263694973a8adb26c21d75322164fb8c493039fe2"
+dependencies = [
+ "portable-atomic",
+ "rapidhash",
+]
+
+[[package]]
 name = "metrics-exporter-prometheus"
 version = "0.15.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1012,7 +1022,7 @@ checksum = "b4f0c8427b39666bf970460908b213ec09b3b350f20c0c2eabcbba51704a08e6"
 dependencies = [
  "base64 0.22.1",
  "indexmap",
- "metrics",
+ "metrics 0.23.1",
  "metrics-util",
  "quanta",
  "thiserror 1.0.69",
@@ -1027,7 +1037,7 @@ dependencies = [
  "crossbeam-epoch",
  "crossbeam-utils",
  "hashbrown 0.14.5",
- "metrics",
+ "metrics 0.23.1",
  "num_cpus",
  "quanta",
  "sketches-ddsketch",
@@ -1335,6 +1345,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "caa0f4137e1c0a72f4c651489402276c8e8e1cf081f3b0ba156d2cbeef09e86a"
 dependencies = [
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "rapidhash"
+version = "4.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5da7e78a036ce858e8d55b7e7dc8ba3a88b78350fd2155d3591bbd966b58589e"
+dependencies = [
+ "rustversion",
 ]
 
 [[package]]
