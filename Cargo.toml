@@ -45,7 +45,7 @@ serde_yaml = "0.9"
 sha2 = "0.10"
 thiserror = "1"
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
 tower-http = { version = "0.6", features = ["catch-panic", "set-header"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
