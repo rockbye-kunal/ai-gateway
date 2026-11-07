@@ -227,20 +227,62 @@ fn add_guardrail_header(guard: &RequestGuard, h: &mut HeaderMap) {
 }
 
 /// `GET /v1/models`: routes this key may use, with prices when configured.
+#[derive(serde::Deserialize, Default)]
+pub struct ModelsQuery {
+    /// Only this provider's models.
+    pub provider: Option<String>,
+}
+
+/// One catalog model as an OpenAI `model` object, with its price.
+pub fn catalog_entry(app: &AppState, rt: &Runtime, provider: &str, m: &crate::catalog::ModelInfo) -> Value {
+    let found = rt
+        .providers
+        .get(provider)
+        .and_then(|p| app.pricing.lookup(&rt.cfg.pricing, provider, &p.cfg, &direct_target(provider, &m.id)));
+    let (input, output, cached, source) = match (found, m.input_per_mtok, m.output_per_mtok) {
+        (Some((p, src)), _, _) => {
+            (Some(p.input_per_mtok), Some(p.output_per_mtok), p.cached_input_per_mtok, Some(src))
+        }
+        (None, Some(i), Some(o)) => (Some(i), Some(o), None, Some("provider")),
+        _ => (None, None, None, None),
+    };
+    let mut v = json!({
+        "id": format!("{provider}/{}", m.id),
+        "object": "model",
+        "created": m.created.unwrap_or(0),
+        "owned_by": provider,
+        "pricing": {"input_per_mtok": input, "output_per_mtok": output, "cached_input_per_mtok": cached},
+    });
+    if let Some(n) = &m.name {
+        v["name"] = json!(n);
+    }
+    if let Some(c) = m.context_length {
+        v["context_length"] = json!(c);
+    }
+    if let Some(s) = source {
+        v["pricing"]["source"] = json!(s);
+    }
+    v
+}
+
+/// `GET /v1/models`: the routes this key may use, then every model of every
+/// provider that has a key, as `provider/model`, from the providers' own
+/// model lists (cached for an hour).
 pub async fn list_models(
     State(app): State<Arc<AppState>>,
     headers: HeaderMap,
+    axum::extract::Query(q): axum::extract::Query<ModelsQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let tenant = app.keys.authenticate(&headers)?;
     let rt = app.rt();
-    let mut ids: Vec<&String> = rt.routes.keys().filter(|r| tenant.allows_route(r)).collect();
-    ids.sort();
-    let data: Vec<Value> = ids
-        .into_iter()
-        .map(|id| {
+    let mut data: Vec<Value> = Vec::new();
+    if q.provider.is_none() {
+        let mut ids: Vec<&String> = rt.routes.keys().filter(|r| tenant.allows_route(r)).collect();
+        ids.sort();
+        for id in ids {
             let r = &rt.routes[id];
             let price = target_price(&app, &rt, &r.targets[0]);
-            json!({
+            data.push(json!({
                 "id": id, "object": "model", "created": 0, "owned_by": "gateway",
                 "targets": r.targets.iter().map(|t| format!("{}/{}", t.provider, t.model)).collect::<Vec<_>>(),
                 "pricing": {
@@ -248,9 +290,19 @@ pub async fn list_models(
                     "output_per_mtok": price.map(|p| p.output_per_mtok),
                     "cached_input_per_mtok": price.and_then(|p| p.cached_input_per_mtok),
                 },
-            })
-        })
-        .collect();
+            }));
+        }
+    }
+    for list in crate::catalog::Catalog::lists(&app, false).await {
+        if q.provider.as_deref().is_some_and(|p| p != list.provider) {
+            continue;
+        }
+        for m in &list.models {
+            if tenant.allows_direct(&list.provider, &m.id) {
+                data.push(catalog_entry(&app, &rt, &list.provider, m));
+            }
+        }
+    }
     Ok(Json(json!({"object": "list", "data": data})))
 }
 
@@ -456,6 +508,13 @@ async fn run_targets(
     let mut last_error = ApiError::unavailable("no upstream provider is available for this model");
     for target in targets {
         let Some(provider) = ctx.rt.providers.get(&target.provider) else { continue };
+        if !provider_ready(ctx.app, provider, Some(opts)) {
+            last_error = ApiError::unavailable(format!(
+                "provider '{}' has no API key; add one in the dashboard or its environment variable",
+                provider.name
+            ));
+            continue;
+        }
         if ctx.rt.cfg.limits.iter().any(|l| l.per == "provider") {
             let dims =
                 Dims { tenant: &tenant.name, user: opts.user.as_deref(), model, metadata: &opts.metadata };
@@ -715,7 +774,7 @@ fn resolve_model(
         return Ok(order_targets(Some(app), strategy, targets, opts.session_id.as_deref()));
     }
     if let Some((provider, upstream_model)) = model.split_once('/') {
-        if let Some(p) = rt.providers.get(provider) {
+        if let Some(p) = rt.providers.get(provider).filter(|p| provider_ready(app, p, Some(opts))) {
             if !tenant.allows_direct(provider, upstream_model) {
                 return Err(ApiError::forbidden(format!("this API key may not use model '{model}'")));
             }
@@ -985,6 +1044,17 @@ pub enum Attempt {
 /// The provider key to use: a key the client sent for this provider
 /// (request-scoped BYOK), a key stored through the admin API, or the key in
 /// the config file.
+/// Whether a provider can be called: it has a key in the config or the
+/// environment, uses cloud credentials (Bedrock, Vertex), has a key stored in
+/// the dashboard, or the request brings one. Built-in providers without any
+/// of these are skipped, and their models go to `default_provider`.
+pub fn provider_ready(app: &AppState, p: &Provider, opts: Option<&RequestOptions>) -> bool {
+    !p.cfg.api_key.expose().is_empty()
+        || matches!(p.cfg.kind, ProviderKind::Bedrock | ProviderKind::Vertex)
+        || app.stored_provider_keys.read().contains_key(&p.name)
+        || opts.is_some_and(|o| p.cfg.allow_client_keys && o.byok.contains_key(&p.name))
+}
+
 pub fn credentials(app: &AppState, provider: &Provider, opts: &RequestOptions) -> (String, &'static str) {
     if provider.cfg.allow_client_keys {
         if let Some(k) = opts.byok.get(&provider.name) {

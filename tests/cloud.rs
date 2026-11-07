@@ -283,6 +283,7 @@ server:
   admin_listen: 127.0.0.1:0
 admin:
   token_sha256: "{admin}"
+auto_providers: false
 pricing:
   url: http://{m}/prices.json
   overrides:

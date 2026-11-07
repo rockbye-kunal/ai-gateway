@@ -43,7 +43,14 @@ pub struct Config {
     pub store: StoreConfig,
     #[serde(default)]
     pub cache: CacheConfig,
+    /// Providers defined in the file. Built-in providers (see `builtin.rs`)
+    /// and providers added in the dashboard are merged in at runtime.
+    #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
+    /// Make the built-in providers (OpenAI, Anthropic, Groq, …) available as
+    /// `<name>/<model>` once they have a key, without listing them here.
+    #[serde(default = "d_true")]
+    pub auto_providers: bool,
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
     /// Provider that receives any `model` that is neither a route name nor
@@ -51,6 +58,9 @@ pub struct Config {
     /// Typically an aggregator such as OpenRouter.
     #[serde(default)]
     pub default_provider: Option<String>,
+    /// May be empty when an admin token is set and keys are created in the
+    /// dashboard.
+    #[serde(default)]
     pub keys: Vec<KeyConfig>,
     #[serde(default)]
     pub admin: AdminConfig,
@@ -477,9 +487,26 @@ pub enum ProviderKind {
     Vertex,
 }
 
+/// Where a provider definition came from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderSource {
+    /// The config file.
+    #[default]
+    Config,
+    /// Known to the gateway; enabled by a key from the environment, the
+    /// dashboard or the request.
+    Builtin,
+    /// Added through the dashboard or admin API.
+    Dashboard,
+}
+
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
+    /// Not read from YAML; set by the gateway.
+    #[serde(skip)]
+    pub source: ProviderSource,
     pub kind: ProviderKind,
     /// Derived from `region` (and `project`) for Bedrock and Vertex.
     #[serde(default)]
@@ -584,7 +611,7 @@ fn d_open() -> u64 {
     30
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteConfig {
     /// The name clients send as `model`.
@@ -599,7 +626,7 @@ pub struct RouteConfig {
     pub branches: Vec<RouteBranch>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteBranch {
     /// Field → condition. Fields: `key`, `user`, `tags`, `metadata.<name>`.
@@ -610,21 +637,25 @@ pub struct RouteBranch {
     pub targets: Vec<TargetConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, serde::Serialize)]
 #[serde(untagged)]
 pub enum Condition {
     Equals(String),
     Op(ConditionOp),
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, serde::Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ConditionOp {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub eq: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ne: Option<String>,
-    #[serde(rename = "in")]
+    #[serde(rename = "in", skip_serializing_if = "Option::is_none")]
     pub one_of: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub not_in: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub exists: Option<bool>,
 }
 
@@ -644,20 +675,20 @@ pub enum RouteStrategy {
     Cost,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, PartialEq, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TargetConfig {
     pub provider: String,
     pub model: String,
     /// USD per million input tokens, for cost reporting.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price_input_per_mtok: Option<f64>,
     /// USD per million output tokens, for cost reporting.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub price_output_per_mtok: Option<f64>,
     /// Share of traffic for `strategy: weighted` routes (default 1). A weight
     /// of 0 makes the target a fallback only.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<u32>,
 }
 
@@ -695,9 +726,61 @@ impl Config {
     }
 
     pub fn from_yaml_str(text: &str) -> Result<Self> {
+        Self::from_yaml_str_with_env(text, &|k| std::env::var(k).ok())
+    }
+
+    /// Like `from_yaml_str`, reading built-in provider keys through `env`
+    /// (tests pass their own).
+    pub fn from_yaml_str_with_env(text: &str, env: &dyn Fn(&str) -> Option<String>) -> Result<Self> {
         let mut value: Value = serde_yaml::from_str(text).context("parsing YAML")?;
         substitute_env(&mut value)?;
         let mut cfg: Config = serde_yaml::from_value(value).context("invalid configuration")?;
+        if cfg.auto_providers {
+            for (name, p) in crate::builtin::providers(env) {
+                cfg.providers.entry(name).or_insert(p);
+            }
+        }
+        cfg.fill_defaults();
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// This config plus providers and routes added in the dashboard.
+    /// Dashboard providers replace built-in ones of the same name but never
+    /// config-file ones; routes never replace config-file routes.
+    pub fn with_dynamic(
+        &self,
+        providers: &std::collections::BTreeMap<String, ProviderConfig>,
+        routes: &std::collections::BTreeMap<String, RouteConfig>,
+    ) -> Result<Self> {
+        let mut cfg = self.clone();
+        for (name, p) in providers {
+            let old = cfg.providers.get(name);
+            if old.is_some_and(|o| o.source == ProviderSource::Config) {
+                continue;
+            }
+            let mut p = p.clone();
+            p.source = ProviderSource::Dashboard;
+            // Overriding a built-in provider keeps its environment key only
+            // while the endpoint is the same, so the key is never sent to a
+            // different host.
+            if p.api_key.expose().is_empty() {
+                let same_endpoint = |o: &ProviderConfig| {
+                    o.kind == p.kind
+                        && (p.base_url.trim().is_empty()
+                            || o.base_url.trim_end_matches('/') == p.base_url.trim_end_matches('/'))
+                };
+                if let Some(o) = old.filter(|o| o.source == ProviderSource::Builtin && same_endpoint(o)) {
+                    p.api_key = o.api_key.clone();
+                }
+            }
+            cfg.providers.insert(name.clone(), p);
+        }
+        for r in routes.values() {
+            if !cfg.routes.iter().any(|x| x.name == r.name) {
+                cfg.routes.push(r.clone());
+            }
+        }
         cfg.fill_defaults();
         cfg.validate()?;
         Ok(cfg)
@@ -760,7 +843,9 @@ impl Config {
                 bail!("provider name '{name}' may only contain letters, digits, '-', '_' and '.'");
             }
             let cloud = matches!(p.kind, ProviderKind::Bedrock | ProviderKind::Vertex);
-            if !cloud && p.api_key.expose().trim().is_empty() {
+            // Built-in and dashboard providers get their key from the
+            // environment, the dashboard or the request.
+            if p.source == ProviderSource::Config && !cloud && p.api_key.expose().trim().is_empty() {
                 bail!("provider {name}: api_key is empty");
             }
             if p.base_url.trim().is_empty() {
@@ -887,8 +972,10 @@ impl Config {
             }
         }
 
-        if self.keys.is_empty() {
-            bail!("at least one API key must be configured");
+        if self.keys.is_empty() && self.admin.token_sha256.is_none() {
+            bail!(
+                "configure at least one API key, or set admin.token_sha256 and create keys in the dashboard"
+            );
         }
         let mut key_names = HashSet::new();
         let mut key_hashes = HashSet::new();

@@ -20,7 +20,7 @@ use serde_json::{json, Value};
 use crate::{
     app::AppState,
     auth::{generate_key, hash_key, StoredKey, STORED_KEYS},
-    config::{valid_ident, valid_model, RuleAction, Secret},
+    config::{valid_ident, valid_model, ProviderKind, ProviderSource, RouteConfig, RuleAction, Secret},
     error::ApiError,
     logs::{self, Feedback, LogQuery, ReportQuery},
     proxy::{budget_key, unix_millis, unix_secs},
@@ -31,6 +31,10 @@ use crate::{
 const DASHBOARD_HTML: &str = include_str!("../dashboard/index.html");
 const DASHBOARD_JS: &str = include_str!("../dashboard/app.js");
 const PROVIDER_KEYS: &str = "provider_keys";
+/// Providers added through the admin API: name -> provider config JSON (no keys).
+const STORED_PROVIDERS: &str = "dashboard_providers";
+/// Routes added through the admin API: name -> route config JSON.
+const STORED_ROUTES: &str = "dashboard_routes";
 const AUDIT_LIST: &str = "audit";
 
 fn authorize(app: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
@@ -307,6 +311,14 @@ pub async fn refresh_dynamic(app: &AppState) -> Result<(), StoreError> {
             }
         }
         *app.stored_provider_keys.write() = keys;
+    }
+
+    let raw = crate::app::DynamicRaw {
+        providers: app.store.hgetall(STORED_PROVIDERS).await?.into_iter().collect(),
+        routes: app.store.hgetall(STORED_ROUTES).await?.into_iter().collect(),
+    };
+    if let Err(e) = app.apply_dynamic(raw) {
+        tracing::warn!(error = %format!("{e:#}"), "providers or routes from the dashboard are not valid; keeping the current ones");
     }
     Ok(())
 }
@@ -663,6 +675,443 @@ pub async fn delete_provider_key(
     app.stored_provider_keys.write().remove(&provider);
     audit(&app, "provider_key.delete", &provider, json!({})).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Dashboard providers and routes as stored now (not the copy in memory,
+/// which another replica may have changed since the last refresh).
+async fn stored_dynamic(app: &AppState) -> Result<crate::app::DynamicRaw, ApiError> {
+    Ok(crate::app::DynamicRaw {
+        providers: app
+            .store
+            .hgetall(STORED_PROVIDERS)
+            .await
+            .map_err(store_unavailable)?
+            .into_iter()
+            .collect(),
+        routes: app.store.hgetall(STORED_ROUTES).await.map_err(store_unavailable)?.into_iter().collect(),
+    })
+}
+
+/// Re-reads the store and applies it; fails if `entry` (`provider:x` or
+/// `route:x`) ended up skipped.
+async fn apply_and_check(app: &AppState, entry: &str) -> Result<(), ApiError> {
+    refresh_dynamic(app).await.map_err(store_unavailable)?;
+    match app.dynamic_errors().get(entry) {
+        Some(why) => Err(ApiError::bad_request(why.clone())),
+        None => Ok(()),
+    }
+}
+
+/// Every provider the gateway knows: from the config file, built in, or
+/// added in the dashboard, with whether it has a key.
+pub async fn list_providers(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&app, &headers)?;
+    let rt = app.rt();
+    let stored = app.stored_provider_keys.read().clone();
+    let mut data: Vec<Value> = rt
+        .providers
+        .values()
+        .map(|p| {
+            let cloud = matches!(p.cfg.kind, ProviderKind::Bedrock | ProviderKind::Vertex);
+            let (key, key_hint) = match stored.get(&p.name) {
+                Some(k) => ("stored", hint(k.expose())),
+                None if !p.cfg.api_key.expose().is_empty() => match p.cfg.source {
+                    ProviderSource::Builtin => ("environment", hint(p.cfg.api_key.expose())),
+                    _ => ("config", hint(p.cfg.api_key.expose())),
+                },
+                None if cloud => ("cloud", String::new()),
+                None => ("none", String::new()),
+            };
+            json!({
+                "name": p.name,
+                "label": crate::builtin::label(&p.name),
+                "kind": p.cfg.kind,
+                "base_url": p.cfg.base_url,
+                "region": p.cfg.region,
+                "project": p.cfg.project,
+                "source": p.cfg.source,
+                "ready": crate::proxy::provider_ready(&app, p, None),
+                "key": key,
+                "key_hint": key_hint,
+                "default": rt.cfg.default_provider.as_deref() == Some(p.name.as_str()),
+            })
+        })
+        .collect();
+    // Dashboard providers that couldn't be applied, so they can be fixed or
+    // removed.
+    for (entry, why) in app.dynamic_errors() {
+        if let Some(name) = entry.strip_prefix("provider:") {
+            data.retain(|p| p["name"] != name || p["source"] != "builtin");
+            data.push(
+                json!({"name": name, "source": "dashboard", "ready": false, "key": "none", "error": why}),
+            );
+        }
+    }
+    data.sort_by(|a, b| {
+        (!a["ready"].as_bool().unwrap_or(false), a["name"].as_str())
+            .cmp(&(!b["ready"].as_bool().unwrap_or(false), b["name"].as_str()))
+    });
+    Ok(Json(json!({ "data": data, "storage_enabled": app.cipher.is_some() })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderBody {
+    kind: ProviderKind,
+    #[serde(default)]
+    base_url: Option<String>,
+    /// Stored encrypted, separately from the provider definition.
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    region: Option<String>,
+    #[serde(default)]
+    project: Option<String>,
+    #[serde(default)]
+    api_version: Option<String>,
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    #[serde(default)]
+    max_retries: Option<u32>,
+    #[serde(default)]
+    zero_data_retention: Option<bool>,
+    #[serde(default)]
+    no_prompt_training: Option<bool>,
+    #[serde(default)]
+    auto_prompt_cache: Option<bool>,
+    #[serde(default)]
+    allow_insecure_http: Option<bool>,
+}
+
+/// Adds or replaces a provider defined in the dashboard. Its API key, if
+/// given, is stored encrypted like other stored provider keys.
+pub async fn put_provider(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(b): Json<ProviderBody>,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&app, &headers)?;
+    if !valid_ident(&name) {
+        return Err(ApiError::bad_request(
+            "provider names may only contain letters, digits, '-', '_' and '.'",
+        ));
+    }
+    let base = app.base_cfg();
+    let existing = base.providers.get(&name);
+    if existing.is_some_and(|p| p.source == ProviderSource::Config) {
+        return Err(conflict(
+            "defined_in_config",
+            format!("provider '{name}' is defined in the config file; change it there"),
+        ));
+    }
+    let cloud = matches!(b.kind, ProviderKind::Bedrock | ProviderKind::Vertex);
+    if cloud && b.base_url.as_deref().is_some_and(|u| !u.trim().is_empty()) {
+        // They sign with the gateway's own AWS or Google credentials, which
+        // must only go to AWS or Google; the endpoint comes from the region.
+        return Err(ApiError::bad_request(
+            "Bedrock and Vertex endpoints come from the region; base_url can't be set for them here",
+        ));
+    }
+    let key = b.api_key.as_deref().map(str::trim).filter(|k| !k.is_empty());
+    if let Some(k) = key {
+        if k.len() > 1024 || axum::http::HeaderValue::from_str(k).is_err() {
+            return Err(ApiError::bad_request("api_key must be 1-1024 printable characters"));
+        }
+        if app.cipher.is_none() {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "invalid_request_error",
+                "storage_disabled",
+                "set admin.encryption_key to store provider keys",
+            ));
+        }
+    }
+    // A built-in name keeps its endpoint unless a new one is given.
+    let base_url = b
+        .base_url
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .or_else(|| existing.filter(|p| p.kind == b.kind).map(|p| p.base_url.clone()));
+    let mut def = serde_json::Map::new();
+    def.insert("kind".into(), json!(b.kind));
+    let opt = |def: &mut serde_json::Map<String, Value>, k: &str, v: Option<Value>| {
+        if let Some(v) = v {
+            def.insert(k.into(), v);
+        }
+    };
+    opt(&mut def, "base_url", base_url.map(Value::from));
+    opt(&mut def, "region", b.region.filter(|v| !v.is_empty()).map(Value::from));
+    opt(&mut def, "project", b.project.filter(|v| !v.is_empty()).map(Value::from));
+    opt(&mut def, "api_version", b.api_version.filter(|v| !v.is_empty()).map(Value::from));
+    opt(&mut def, "timeout_secs", b.timeout_secs.map(Value::from));
+    opt(&mut def, "max_retries", b.max_retries.map(Value::from));
+    opt(&mut def, "zero_data_retention", b.zero_data_retention.map(Value::from));
+    opt(&mut def, "no_prompt_training", b.no_prompt_training.map(Value::from));
+    opt(&mut def, "auto_prompt_cache", b.auto_prompt_cache.map(Value::from));
+    opt(&mut def, "allow_insecure_http", b.allow_insecure_http.map(Value::from));
+    // A key already kept for this name (stored, or from the environment)
+    // must not follow the provider to a different kind or endpoint. Stored
+    // keys are kept by name, so this holds even when no provider of that
+    // name is loaded right now.
+    if key.is_none() {
+        let current = app.rt().providers.get(&name).cloned();
+        let stored = app.stored_provider_keys.read().contains_key(&name);
+        let env_key = current.as_ref().is_some_and(|c| !c.cfg.api_key.expose().is_empty());
+        if stored || env_key {
+            let new_url = def.get("base_url").and_then(Value::as_str).unwrap_or("");
+            let new_region = def.get("region").and_then(Value::as_str);
+            let same = current.as_ref().is_some_and(|c| {
+                c.cfg.kind == b.kind
+                    && if cloud {
+                        c.cfg.region.as_deref() == new_region
+                    } else {
+                        c.cfg.base_url.trim_end_matches('/') == new_url.trim_end_matches('/')
+                    }
+            });
+            if !same {
+                return Err(ApiError::bad_request(format!(
+                    "'{name}' has an API key for a different endpoint; send api_key for this one too"
+                )));
+            }
+        }
+    }
+    let def = Value::Object(def).to_string();
+
+    let raw_before = stored_dynamic(&app).await?;
+    let mut raw = raw_before.clone();
+    raw.providers.insert(name.clone(), def.clone());
+    if let Some(why) = app.check_dynamic(&raw).get(&format!("provider:{name}")) {
+        return Err(ApiError::bad_request(why.clone()));
+    }
+
+    // Remember what was stored so a failed apply (say, a concurrent change
+    // on another replica) can be undone.
+    let old_def = raw_before.providers.get(&name).cloned();
+    let old_key = app.store.hgetall(PROVIDER_KEYS).await.map_err(store_unavailable)?.remove(&name);
+    if let (Some(k), Some(cipher)) = (key, &app.cipher) {
+        let enc = cipher.encrypt(k).map_err(|_| ApiError::internal_config("encryption failed"))?;
+        app.store.hset(PROVIDER_KEYS, &name, &enc).await.map_err(store_unavailable)?;
+    }
+    app.store.hset(STORED_PROVIDERS, &name, &def).await.map_err(store_unavailable)?;
+    if let Err(e) = apply_and_check(&app, &format!("provider:{name}")).await {
+        let undo_def = match &old_def {
+            Some(d) => app.store.hset(STORED_PROVIDERS, &name, d).await,
+            None => app.store.hdel(STORED_PROVIDERS, &name).await.map(|_| ()),
+        };
+        let undo_key = match (&old_key, key.is_some()) {
+            (Some(k), true) => app.store.hset(PROVIDER_KEYS, &name, k).await,
+            (None, true) => app.store.hdel(PROVIDER_KEYS, &name).await.map(|_| ()),
+            _ => Ok(()),
+        };
+        if undo_def.is_err() || undo_key.is_err() {
+            tracing::warn!(provider = %name, "could not undo a provider change that failed to apply");
+        }
+        let _ = refresh_dynamic(&app).await;
+        return Err(e);
+    }
+    audit(&app, "provider.set", &name, json!({"kind": b.kind, "key": key.map(hint)})).await;
+    let ready = app.rt().providers.get(&name).is_some_and(|p| crate::proxy::provider_ready(&app, p, None));
+    Ok(Json(json!({"name": name, "ready": ready})))
+}
+
+/// Removes a provider added in the dashboard (and its stored key, unless
+/// a built-in provider of that name still uses it).
+pub async fn delete_provider(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    authorize(&app, &headers)?;
+    let raw = stored_dynamic(&app).await?;
+    if !raw.providers.contains_key(&name) {
+        return Err(not_found(
+            "dashboard provider (config-file and built-in providers can't be removed here)",
+        ));
+    }
+    // Refuse while a dashboard route still sends traffic to it (unless a
+    // built-in provider of the same name would take over).
+    if !app.base_cfg().providers.contains_key(&name) {
+        let users: Vec<String> = raw
+            .routes
+            .iter()
+            .filter(|(_, v)| {
+                serde_json::from_str::<RouteConfig>(v).is_ok_and(|r| {
+                    r.targets
+                        .iter()
+                        .chain(r.branches.iter().flat_map(|b| b.targets.iter()))
+                        .any(|t| t.provider == name)
+                })
+            })
+            .map(|(n, _)| n.clone())
+            .collect();
+        if !users.is_empty() {
+            return Err(conflict(
+                "in_use",
+                format!("'{name}' is used by the route(s) {}; change or delete them first", users.join(", ")),
+            ));
+        }
+    }
+    app.store.hdel(STORED_PROVIDERS, &name).await.map_err(store_unavailable)?;
+    if !app.base_cfg().providers.contains_key(&name) {
+        app.store.hdel(PROVIDER_KEYS, &name).await.map_err(store_unavailable)?;
+        app.stored_provider_keys.write().remove(&name);
+    }
+    refresh_dynamic(&app).await.map_err(store_unavailable)?;
+    audit(&app, "provider.delete", &name, json!({})).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// All routes, with where each is defined.
+pub async fn list_routes(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&app, &headers)?;
+    let rt = app.rt();
+    let from_file: std::collections::HashSet<String> =
+        app.base_cfg().routes.iter().map(|r| r.name.clone()).collect();
+    let mut data: Vec<Value> = rt
+        .cfg
+        .routes
+        .iter()
+        .map(|r| {
+            let mut v = serde_json::to_value(r).unwrap_or_default();
+            v["source"] = json!(if from_file.contains(&r.name) { "config" } else { "dashboard" });
+            v
+        })
+        .collect();
+    let raw = app.dynamic();
+    for (entry, why) in app.dynamic_errors() {
+        if let Some(name) = entry.strip_prefix("route:") {
+            let mut v = raw
+                .routes
+                .get(name)
+                .and_then(|r| serde_json::from_str::<Value>(r).ok())
+                .filter(Value::is_object)
+                .unwrap_or_else(|| json!({"targets": [], "branches": []}));
+            v["name"] = json!(name);
+            v["source"] = json!("dashboard");
+            v["error"] = json!(why);
+            data.push(v);
+        }
+    }
+    data.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    Ok(Json(json!({ "data": data })))
+}
+
+/// Adds or replaces a route defined in the dashboard. The body is a route
+/// in the config file's shape; its name comes from the path.
+pub async fn put_route(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Json(mut body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&app, &headers)?;
+    if !valid_ident(&name) {
+        return Err(ApiError::bad_request("route names may only contain letters, digits, '-', '_' and '.'"));
+    }
+    if app.base_cfg().routes.iter().any(|r| r.name == name) {
+        return Err(conflict(
+            "defined_in_config",
+            format!("route '{name}' is defined in the config file; change it there"),
+        ));
+    }
+    let Some(obj) = body.as_object_mut() else {
+        return Err(ApiError::bad_request("the body must be a route object"));
+    };
+    obj.insert("name".into(), json!(name));
+    let route: RouteConfig =
+        serde_json::from_value(body).map_err(|e| ApiError::bad_request(format!("invalid route: {e}")))?;
+    let def =
+        serde_json::to_string(&route).map_err(|_| ApiError::internal_config("route encoding failed"))?;
+    let mut raw = stored_dynamic(&app).await?;
+    let old_def = raw.routes.get(&name).cloned();
+    raw.routes.insert(name.clone(), def.clone());
+    if let Some(why) = app.check_dynamic(&raw).get(&format!("route:{name}")) {
+        return Err(ApiError::bad_request(why.clone()));
+    }
+    app.store.hset(STORED_ROUTES, &name, &def).await.map_err(store_unavailable)?;
+    if let Err(e) = apply_and_check(&app, &format!("route:{name}")).await {
+        let undo = match &old_def {
+            Some(d) => app.store.hset(STORED_ROUTES, &name, d).await,
+            None => app.store.hdel(STORED_ROUTES, &name).await.map(|_| ()),
+        };
+        if undo.is_err() {
+            tracing::warn!(route = %name, "could not undo a route change that failed to apply");
+        }
+        let _ = refresh_dynamic(&app).await;
+        return Err(e);
+    }
+    audit(&app, "route.set", &name, json!({"targets": route.targets.len()})).await;
+    Ok(Json(serde_json::to_value(&route).unwrap_or_default()))
+}
+
+pub async fn delete_route(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    authorize(&app, &headers)?;
+    if !app.store.hdel(STORED_ROUTES, &name).await.map_err(store_unavailable)? {
+        return Err(not_found("dashboard route (routes from the config file are removed there)"));
+    }
+    refresh_dynamic(&app).await.map_err(store_unavailable)?;
+    audit(&app, "route.delete", &name, json!({})).await;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize, Default)]
+pub struct CatalogQuery {
+    #[serde(default)]
+    refresh: bool,
+}
+
+/// Every model of every provider with a key, with prices, plus each
+/// provider's list status.
+pub async fn list_models(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<CatalogQuery>,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&app, &headers)?;
+    Ok(Json(catalog_json(&app, q.refresh).await))
+}
+
+/// Fetches every provider's model list again now.
+pub async fn refresh_models(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&app, &headers)?;
+    let v = catalog_json(&app, true).await;
+    audit(&app, "models.refresh", "catalog", json!({"models": v["data"].as_array().map(Vec::len)})).await;
+    Ok(Json(v))
+}
+
+async fn catalog_json(app: &Arc<AppState>, force: bool) -> Value {
+    let lists = crate::catalog::Catalog::lists(app, force).await;
+    let rt = app.rt();
+    let providers: Vec<Value> = lists
+        .iter()
+        .map(|l| {
+            json!({
+                "provider": l.provider,
+                "models": l.models.len(),
+                "fetched_at": l.fetched_at,
+                "error": l.error,
+            })
+        })
+        .collect();
+    let data: Vec<Value> = lists
+        .iter()
+        .flat_map(|l| l.models.iter().map(|m| crate::proxy::catalog_entry(app, &rt, &l.provider, m)))
+        .collect();
+    json!({ "providers": providers, "data": data })
 }
 
 pub async fn list_limits(
