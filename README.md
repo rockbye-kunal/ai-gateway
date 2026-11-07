@@ -1,10 +1,15 @@
 # AI Gateway
 
 [![ci](https://github.com/rockbye-kunal/ai-gateway/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/rockbye-kunal/ai-gateway/actions/workflows/ci.yml)
+[![live](https://github.com/rockbye-kunal/ai-gateway/actions/workflows/live.yml/badge.svg?branch=main)](https://github.com/rockbye-kunal/ai-gateway/actions/workflows/live.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+![Rust 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange.svg)
 
 A self-hosted AI gateway written in Rust. It gives your apps one OpenAI-compatible API in front of OpenAI, Anthropic, Azure OpenAI, AWS Bedrock, Google Vertex AI, Gemini, Groq, OpenRouter and any other OpenAI-compatible provider, and adds the controls that Cloudflare AI Gateway and Vercel AI Gateway offer: routing and fallbacks, retries, rate and spend limits, caching, guardrails, cost tracking, request logs and a web dashboard.
 
 Your apps keep using the OpenAI or Anthropic SDKs; you only change the base URL and the API key. The gateway runs as one or more replicas behind a load balancer, with Redis holding the state they share.
+
+AI Gateway is open source under the MIT or Apache-2.0 licence, at your option. It is young (version 0.x), so settings may still change between versions; the [changelog](CHANGELOG.md) lists what changed.
 
 ## Contents
 
@@ -18,6 +23,7 @@ Your apps keep using the OpenAI or Anthropic SDKs; you only change the base URL 
 - [Running in production](#running-in-production)
 - [Development](#development)
 - [How it compares](#how-it-compares)
+- [Contributing](#contributing), [security](#security) and [license](#license)
 
 ## Features
 
@@ -456,3 +462,22 @@ Not included:
 - **Automated evaluations and log classification** with an LLM judge; human feedback and per-model comparisons are included.
 - **Translating** the Messages API to non-Anthropic models, or the Responses API to non-OpenAI models; each goes to providers that speak it natively.
 - Response guardrails on streamed responses, multipart uploads (image edits, transcription) through the unified API (use `/native/...`), and video generation.
+
+## Contributing
+
+Contributions are welcome: bug reports, fixes, new providers and documentation. [CONTRIBUTING.md](CONTRIBUTING.md) explains how to set up, test and send a pull request, and everyone taking part follows the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+## Security
+
+Please report vulnerabilities privately, as described in [SECURITY.md](SECURITY.md), not in public issues. The same file has advice on running the gateway safely.
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <https://www.apache.org/licenses/LICENSE-2.0>)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or <https://opensource.org/licenses/MIT>)
+
+at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.

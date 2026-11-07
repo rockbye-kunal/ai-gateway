@@ -1,0 +1,55 @@
+name: Bug report
+description: Something in the gateway doesn't work as documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. For security problems, don't use this form: follow SECURITY.md instead.
+        Remove API keys, tokens and private prompts from everything you paste.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How to reproduce it
+      description: The request you sent (curl or SDK code) and the response or error you got.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: Relevant configuration
+      description: The parts of config.yaml involved, with secrets removed.
+      render: yaml
+  - type: textarea
+    id: logs
+    attributes:
+      label: Gateway log
+      description: Log lines around the problem (look for the x-request-id of the request).
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: e.g. 0.1.0 or 5c72e88
+    validations:
+      required: true
+  - type: dropdown
+    id: store
+    attributes:
+      label: Store
+      options:
+        - memory
+        - redis
+  - type: input
+    id: providers
+    attributes:
+      label: Providers involved
+      placeholder: e.g. openai, bedrock, vertex

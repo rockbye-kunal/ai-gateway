@@ -4,7 +4,11 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Self-hosted AI gateway: one OpenAI-compatible API in front of OpenAI, Anthropic, Azure OpenAI, AWS Bedrock, Google Vertex AI and other providers"
+license = "MIT OR Apache-2.0"
 repository = "https://github.com/rockbye-kunal/ai-gateway"
+homepage = "https://github.com/rockbye-kunal/ai-gateway"
+keywords = ["ai-gateway", "llm", "openai", "anthropic", "proxy"]
+categories = ["web-programming::http-server", "network-programming"]
 readme = "README.md"
 publish = false
 
