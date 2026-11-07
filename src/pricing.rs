@@ -104,6 +104,7 @@ fn host_prefix(base_url: &str) -> Option<&'static str> {
         ("api.cerebras.ai", "cerebras/"),
         ("api.perplexity.ai", "perplexity/"),
         ("api.anthropic.com", ""),
+        ("openrouter.ai", "openrouter/"),
     ];
     table.iter().find(|(h, _)| host.ends_with(h)).map(|(_, p)| *p)
 }
@@ -329,6 +330,8 @@ mod tests {
         assert_eq!(candidates("openai", &openai, "gpt-4o")[0], "gpt-4o");
         let groq = provider(ProviderKind::Openai, "https://api.groq.com/openai/v1");
         assert_eq!(candidates("groq", &groq, "llama-3.3-70b")[0], "groq/llama-3.3-70b");
+        let or = provider(ProviderKind::Openai, "https://openrouter.ai/api/v1");
+        assert_eq!(candidates("router", &or, "openai/gpt-4o-mini")[0], "openrouter/openai/gpt-4o-mini");
         let anth = provider(ProviderKind::Anthropic, "https://api.anthropic.com/v1");
         assert!(candidates("anthropic", &anth, "claude-sonnet-4-5-20250929")
             .contains(&"claude-sonnet-4-5".to_string()));

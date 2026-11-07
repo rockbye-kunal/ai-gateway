@@ -39,6 +39,11 @@ jobs:
           GW_HASH=$(echo "$KEY_OUT" | awk '/^key_sha256:/ {print $2}')
           echo "::add-mask::$GW_KEY"
           echo "GW_KEY=$GW_KEY" >> "$GITHUB_ENV"
+          ADMIN_OUT=$(./target/release/ai-gateway generate-key)
+          ADMIN_TOKEN=$(echo "$ADMIN_OUT" | awk '/^api_key:/ {print $2}')
+          ADMIN_HASH=$(echo "$ADMIN_OUT" | awk '/^key_sha256:/ {print $2}')
+          echo "::add-mask::$ADMIN_TOKEN"
+          echo "ADMIN_TOKEN=$ADMIN_TOKEN" >> "$GITHUB_ENV"
           cat > live.yaml <<YAML
           server:
             listen: 127.0.0.1:8080
@@ -46,8 +51,16 @@ jobs:
           store:
             backend: redis
             redis_url: \${REDIS_URL}
+          admin:
+            token_sha256: "$ADMIN_HASH"
           cache:
             enabled: true
+          guardrails:
+            rules:
+              - name: no-cards
+                builtin: credit_card
+                action: block
+                apply_to: request
           default_provider: openrouter
           providers:
             openrouter:
@@ -114,6 +127,43 @@ jobs:
             || { cat t.json; exit 1; }
           jq -e '.choices[0].message.tool_calls[0].function.name == "get_weather"' t.json
           jq -r '.choices[0].message.tool_calls[0].function.arguments' t.json | jq -e '.city | length > 0'
+
+      - name: Prices, logs, admin API, guardrails, native passthrough
+        if: steps.keys.outputs.openrouter == 'yes'
+        run: |
+          set -euo pipefail
+          H=(-H "Authorization: Bearer $GW_KEY" -H "Content-Type: application/json")
+          A=(-H "Authorization: Bearer $ADMIN_TOKEN")
+
+          # The public price list downloads, and OpenRouter models are priced from it.
+          curl -sf -X POST localhost:9090/api/pricing/refresh "${A[@]}" -o p.json
+          jq -e '.models > 1000' p.json >/dev/null
+          echo "price list: $(jq -r .models p.json) models"
+          curl -sf localhost:9090/api/pricing "${A[@]}" -o ps.json
+          jq -e '[.targets[] | select(.target == "openrouter/openai/gpt-4o-mini") | .price.input_per_mtok > 0] | any' ps.json
+          jq -r '.targets[] | "\(.route) \(.target): \(.source // "no price")"' ps.json
+
+          # Every request so far is in the log, with tokens and a cost.
+          curl -sf "localhost:9090/api/logs?status=200" "${A[@]}" -o logs.json
+          jq -e '.data | length >= 5' logs.json >/dev/null
+          jq -e '[.data[] | select(.cache_hit != true)] | all(.prompt_tokens + .completion_tokens > 0)' logs.json
+          jq -e '[.data[] | select(.model == "openai/gpt-4o-mini" and .cache_hit != true)] | length > 0 and all(.cost_usd > 0)' logs.json
+          jq -r '.data[] | "\(.model): \(.prompt_tokens + .completion_tokens) tokens, cost \(.cost_usd // "none")"' logs.json
+          curl -sf "localhost:9090/api/overview?range=1h" "${A[@]}" | jq -e '.totals.requests > 0' >/dev/null
+          test "$(curl -s -o /dev/null -w '%{http_code}' localhost:9090/api/logs)" = "401"
+          curl -sf localhost:9090/ | grep -qi "<html"
+
+          # The client's own usage report and model list.
+          curl -sf localhost:8080/v1/models "${H[@]}" | jq -e '.data | map(.id) | index("fallback")' >/dev/null
+
+          # A blocked prompt never reaches OpenRouter.
+          code=$(curl -s -o g.json -w '%{http_code}' localhost:8080/v1/chat/completions "${H[@]}" \
+            -d '{"model":"openrouter/openai/gpt-4o-mini","messages":[{"role":"user","content":"My card is 4111 1111 1111 1111"}]}')
+          test "$code" = "400"; jq -e '.error.code == "content_blocked"' g.json
+
+          # Native passthrough reaches OpenRouter's own API with the gateway's key.
+          curl -sf localhost:8080/native/openrouter/models "${H[@]}" | jq -e '.data | length > 10' >/dev/null
+          echo "all checks passed"
 
       - name: Fallback, cache, auth, rate limit, metrics
         if: steps.keys.outputs.openrouter == 'yes'
