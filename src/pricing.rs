@@ -73,16 +73,19 @@ pub fn parse_litellm(v: &Value) -> HashMap<String, Price> {
             continue;
         }
         let num = |k: &str| e.get(k).and_then(Value::as_f64).filter(|x| x.is_finite() && *x >= 0.0);
-        let (Some(i), Some(o)) = (num("input_cost_per_token"), num("output_cost_per_token")) else {
-            continue;
-        };
+        // Per token -> per million tokens, rounded to remove float noise
+        // (4e-7 * 1e6 is 0.39999999999999997).
+        let per_m = |x: f64| (x * 1e12).round() / 1e6;
+        // Embedding models only have an input price.
+        let Some(i) = num("input_cost_per_token") else { continue };
+        let o = num("output_cost_per_token").unwrap_or(0.0);
         out.insert(
             name.clone(),
             Price {
-                input_per_mtok: i * 1e6,
-                output_per_mtok: o * 1e6,
-                cached_input_per_mtok: num("cache_read_input_token_cost").map(|x| x * 1e6),
-                cache_write_per_mtok: num("cache_creation_input_token_cost").map(|x| x * 1e6),
+                input_per_mtok: per_m(i),
+                output_per_mtok: per_m(o),
+                cached_input_per_mtok: num("cache_read_input_token_cost").map(per_m),
+                cache_write_per_mtok: num("cache_creation_input_token_cost").map(per_m),
             },
         );
     }
@@ -104,7 +107,7 @@ fn host_prefix(base_url: &str) -> Option<&'static str> {
         ("api.cerebras.ai", "cerebras/"),
         ("api.perplexity.ai", "perplexity/"),
         ("api.anthropic.com", ""),
-        ("openrouter.ai", "openrouter/"),
+        ("api.deepinfra.com", "deepinfra/"),
     ];
     table.iter().find(|(h, _)| host.ends_with(h)).map(|(_, p)| *p)
 }
@@ -180,13 +183,47 @@ pub fn candidates(provider_name: &str, p: &ProviderConfig, model: &str) -> Vec<S
             push(model.to_string());
         }
     }
-    let undated: Vec<String> = c.iter().filter_map(|k| undated(k)).collect();
-    for u in undated {
-        if !c.contains(&u) {
-            c.push(u);
+    // Fallbacks, tried after every exact form above:
+    // - without the publisher, as routers like OpenRouter name models
+    //   (`openai/gpt-4o-mini` -> `gpt-4o-mini`);
+    // - without a date or `-latest`;
+    // - with dotted versions written with dashes, as Anthropic names them
+    //   in the list (`claude-haiku-4.5` -> `claude-haiku-4-5`).
+    let mut extra: Vec<String> = Vec::new();
+    if p.kind == ProviderKind::Openai {
+        if let Some((_, bare)) = model.rsplit_once('/') {
+            extra.push(bare.to_string());
+        }
+    }
+    let base: Vec<String> = c.iter().chain(extra.iter()).cloned().collect();
+    extra.extend(base.iter().filter_map(|k| undated(k)));
+    let snapshot: Vec<String> = base.iter().chain(extra.iter()).cloned().collect();
+    extra.extend(snapshot.iter().filter_map(|k| dashed_version(k)));
+    for e in extra {
+        if !c.contains(&e) {
+            c.push(e);
         }
     }
     c
+}
+
+/// `claude-haiku-4.5` -> `claude-haiku-4-5`: a dot between digits becomes a
+/// dash. None when the name has no such dot.
+fn dashed_version(model: &str) -> Option<String> {
+    let b = model.as_bytes();
+    let mut out = String::with_capacity(model.len());
+    let mut changed = false;
+    for (i, ch) in model.char_indices() {
+        let between_digits =
+            ch == '.' && i > 0 && b[i - 1].is_ascii_digit() && b.get(i + 1).is_some_and(u8::is_ascii_digit);
+        if between_digits {
+            out.push('-');
+            changed = true;
+        } else {
+            out.push(ch);
+        }
+    }
+    changed.then_some(out)
 }
 
 impl Pricing {
@@ -309,11 +346,15 @@ mod tests {
         let list = parse_litellm(&json!({
             "sample_spec": {"input_cost_per_token": 0, "output_cost_per_token": 0},
             "gpt-4o": {"input_cost_per_token": 2.5e-6, "output_cost_per_token": 1e-5, "cache_read_input_token_cost": 1.25e-6},
-            "dall-e-3": {"output_cost_per_image": 0.04}
+            "dall-e-3": {"output_cost_per_image": 0.04},
+            "gpt-4.1-mini": {"input_cost_per_token": 4e-7, "output_cost_per_token": 1.6e-6},
+            "text-embedding-3-small": {"input_cost_per_token": 2e-8}
         }));
-        assert_eq!(list.len(), 1);
+        assert_eq!(list.len(), 3);
         let p = list["gpt-4o"];
         assert!((p.input_per_mtok - 2.5).abs() < 1e-9);
+        assert_eq!(list["gpt-4.1-mini"].input_per_mtok, 0.4);
+        assert_eq!(list["text-embedding-3-small"].output_per_mtok, 0.0);
         let u = Usage {
             prompt_tokens: 1_000_000,
             completion_tokens: 100_000,
@@ -331,7 +372,18 @@ mod tests {
         let groq = provider(ProviderKind::Openai, "https://api.groq.com/openai/v1");
         assert_eq!(candidates("groq", &groq, "llama-3.3-70b")[0], "groq/llama-3.3-70b");
         let or = provider(ProviderKind::Openai, "https://openrouter.ai/api/v1");
-        assert_eq!(candidates("router", &or, "openai/gpt-4o-mini")[0], "openrouter/openai/gpt-4o-mini");
+        let c = candidates("openrouter", &or, "openai/gpt-4o-mini");
+        assert_eq!(c[0], "openrouter/openai/gpt-4o-mini");
+        assert!(c.contains(&"gpt-4o-mini".to_string()));
+        let c = candidates("openrouter", &or, "anthropic/claude-haiku-4.5");
+        assert!(c.contains(&"claude-haiku-4-5".to_string()));
+        // Exact names come before the dashed fallback, so Gemini keeps its dot.
+        let c = candidates("openrouter", &or, "google/gemini-2.5-flash");
+        let dot = c.iter().position(|k| k == "gemini-2.5-flash").unwrap();
+        let dash = c.iter().position(|k| k == "gemini-2-5-flash").unwrap();
+        assert!(dot < dash);
+        assert_eq!(dashed_version("claude-sonnet-4.5"), Some("claude-sonnet-4-5".into()));
+        assert_eq!(dashed_version("gpt-4o"), None);
         let anth = provider(ProviderKind::Anthropic, "https://api.anthropic.com/v1");
         assert!(candidates("anthropic", &anth, "claude-sonnet-4-5-20250929")
             .contains(&"claude-sonnet-4-5".to_string()));
