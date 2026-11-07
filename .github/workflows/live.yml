@@ -165,6 +165,62 @@ jobs:
           curl -sf localhost:8080/native/openrouter/models "${H[@]}" | jq -e '.data | length > 10' >/dev/null
           echo "all checks passed"
 
+      - name: Zero-config gateway, live model list, dashboard routes
+        if: steps.keys.outputs.openrouter == 'yes'
+        run: |
+          set -euo pipefail
+          # A second gateway whose config has no providers at all: OpenRouter
+          # comes from OPENROUTER_API_KEY in the environment.
+          cat > zero.yaml <<YAML
+          server:
+            listen: 127.0.0.1:8081
+            admin_listen: 127.0.0.1:9091
+          admin:
+            token_sha256: "$(echo -n "$ADMIN_TOKEN" | ./target/release/ai-gateway hash-key)"
+          default_provider: openrouter
+          keys:
+            - name: zero
+              key_sha256: "$(echo -n "$GW_KEY" | ./target/release/ai-gateway hash-key)"
+              allowed_models: ["*"]
+          YAML
+          ./target/release/ai-gateway check-config zero.yaml
+          nohup ./target/release/ai-gateway serve zero.yaml > zero.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf localhost:8081/readyz && break; sleep 1; done
+          H=(-H "Authorization: Bearer $GW_KEY" -H "Content-Type: application/json")
+          A=(-H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json")
+
+          # The built-in OpenRouter provider is ready from its environment key.
+          curl -sf localhost:9091/api/providers "${A[@]}" -o prov.json
+          jq -e '.data[] | select(.name == "openrouter") | .ready and .key == "environment" and .source == "builtin"' prov.json
+          jq -e '[.data[] | select(.name == "openai")][0].ready == false' prov.json
+
+          # Any model works without listing it: openai/... has no OpenAI key, so
+          # it goes to OpenRouter; openrouter/... names the provider directly.
+          for model in openai/gpt-4o-mini openrouter/google/gemini-2.5-flash; do
+            curl -sS --fail-with-body localhost:8081/v1/chat/completions "${H[@]}" -D zh.txt -o zb.json \
+              -d "{\"model\":\"$model\",\"max_tokens\":10,\"messages\":[{\"role\":\"user\",\"content\":\"Reply with just: pong\"}]}" \
+              || { cat zb.json; exit 1; }
+            grep -i "x-gateway-provider: openrouter" zh.txt
+            echo "$model -> $(jq -r '.choices[0].message.content' zb.json)"
+          done
+
+          # /v1/models is OpenRouter's real catalog, with prices.
+          curl -sf localhost:8081/v1/models "${H[@]}" -o models.json
+          jq -e '.data | length > 100' models.json >/dev/null
+          jq -e '.data[] | select(.id == "openrouter/openai/gpt-4o-mini") | .pricing.input_per_mtok > 0' models.json
+          echo "models listed: $(jq '.data | length' models.json)"
+
+          # A route made through the admin API: Groq has no key and is skipped.
+          curl -sf -X PUT localhost:9091/api/routes/fast "${A[@]}" \
+            -d '{"targets":[{"provider":"groq","model":"llama-3.3-70b-versatile"},{"provider":"openrouter","model":"openai/gpt-4o-mini"}]}'
+          curl -sS --fail-with-body localhost:8081/v1/chat/completions "${H[@]}" -D zh.txt -o zb.json \
+            -d '{"model":"fast","max_tokens":10,"messages":[{"role":"user","content":"Reply with just: ok"}]}' \
+            || { cat zb.json; exit 1; }
+          grep -i "x-gateway-provider: openrouter" zh.txt
+          grep -i "x-gateway-model: openai/gpt-4o-mini" zh.txt
+          curl -sf localhost:8081/v1/models "${H[@]}" | jq -e '.data[0].id == "fast"' >/dev/null
+          echo "zero-config checks passed"
+
       - name: Fallback, cache, auth, rate limit, metrics
         if: steps.keys.outputs.openrouter == 'yes'
         run: |
@@ -200,4 +256,4 @@ jobs:
 
       - name: Gateway log
         if: always() && steps.keys.outputs.openrouter == 'yes'
-        run: cat gateway.log || true
+        run: cat gateway.log zero.log || true
