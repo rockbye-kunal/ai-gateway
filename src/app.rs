@@ -7,7 +7,7 @@
 //! once at startup.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -31,7 +31,7 @@ use tower_http::{catch_panic::CatchPanicLayer, set_header::SetResponseHeaderLaye
 use crate::{
     admin,
     auth::KeyRing,
-    config::{Config, RouteConfig, Secret},
+    config::{Config, ProviderConfig, RouteConfig, Secret},
     export::Exporter,
     guardrails::Guardrails,
     native,
@@ -70,8 +70,53 @@ impl Runtime {
     }
 }
 
+/// Providers and routes added through the admin API, as stored (JSON per
+/// name), so a refresh can tell whether anything changed.
+#[derive(Default, Clone, PartialEq)]
+pub struct DynamicRaw {
+    pub providers: BTreeMap<String, String>,
+    pub routes: BTreeMap<String, String>,
+}
+
+impl DynamicRaw {
+    /// Parses the stored JSON. Entries that no longer parse are skipped.
+    pub fn parse(&self) -> (BTreeMap<String, ProviderConfig>, BTreeMap<String, RouteConfig>) {
+        let providers = self
+            .providers
+            .iter()
+            .filter_map(|(name, v)| match serde_json::from_str::<ProviderConfig>(v) {
+                Ok(p) => Some((name.clone(), p)),
+                Err(e) => {
+                    tracing::warn!(provider = %name, error = %e, "ignoring an unreadable dashboard provider");
+                    None
+                }
+            })
+            .collect();
+        let routes = self
+            .routes
+            .iter()
+            .filter_map(|(name, v)| match serde_json::from_str::<RouteConfig>(v) {
+                Ok(r) if r.name == *name => Some((name.clone(), r)),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!(route = %name, error = %e, "ignoring an unreadable dashboard route");
+                    None
+                }
+            })
+            .collect();
+        (providers, routes)
+    }
+}
+
 pub struct AppState {
     rt: RwLock<Arc<Runtime>>,
+    /// The configuration from the file (or test), before dashboard providers
+    /// and routes are merged in.
+    base_cfg: RwLock<Arc<Config>>,
+    /// Dashboard providers and routes currently applied.
+    dynamic: RwLock<DynamicRaw>,
+    /// Live model lists fetched from providers.
+    pub catalog: crate::catalog::Catalog,
     /// Config file to re-read on reload (none in tests).
     pub config_path: RwLock<Option<String>>,
     pub keys: KeyRing,
@@ -97,6 +142,39 @@ pub struct AppState {
 impl AppState {
     pub fn rt(&self) -> Arc<Runtime> {
         self.rt.read().clone()
+    }
+
+    pub fn base_cfg(&self) -> Arc<Config> {
+        self.base_cfg.read().clone()
+    }
+
+    pub fn dynamic(&self) -> DynamicRaw {
+        self.dynamic.read().clone()
+    }
+
+    /// Checks that dashboard providers and routes would make a valid
+    /// configuration, without applying them.
+    pub fn check_dynamic(&self, raw: &DynamicRaw) -> anyhow::Result<Config> {
+        let (providers, routes) = raw.parse();
+        if providers.len() != raw.providers.len() || routes.len() != raw.routes.len() {
+            anyhow::bail!("a provider or route definition is not valid");
+        }
+        self.base_cfg().with_dynamic(&providers, &routes)
+    }
+
+    /// Applies dashboard providers and routes if they changed. Invalid ones
+    /// leave the running settings as they are.
+    pub fn apply_dynamic(&self, raw: DynamicRaw) -> anyhow::Result<()> {
+        if *self.dynamic.read() == raw {
+            return Ok(());
+        }
+        let cfg = self.check_dynamic(&raw)?;
+        let old = self.rt();
+        let rt = Runtime::build(cfg, &self.http, Some(&old))?;
+        *self.rt.write() = Arc::new(rt);
+        *self.dynamic.write() = raw;
+        tracing::info!("providers and routes from the dashboard applied");
+        Ok(())
     }
 
     pub async fn build(cfg: Config) -> anyhow::Result<Arc<Self>> {
@@ -137,6 +215,9 @@ impl AppState {
             pending_usage_writes: AtomicUsize::new(0),
             stream_cancel: watch::channel(false).0,
             config_path: RwLock::new(None),
+            base_cfg: RwLock::new(Arc::new(cfg.clone())),
+            dynamic: RwLock::new(DynamicRaw::default()),
+            catalog: Default::default(),
             rt: RwLock::new(Arc::new(Runtime::build(cfg, &client, None)?)),
             http: client,
         });
@@ -201,9 +282,21 @@ impl AppState {
         {
             notes.push("log export and OpenTelemetry settings change only on restart".into());
         }
-        let rt = Runtime::build(cfg, &self.http, Some(&old))?;
+        let base = cfg.clone();
+        let (providers, routes) = self.dynamic().parse();
+        let effective = match cfg.with_dynamic(&providers, &routes) {
+            Ok(c) => c,
+            Err(e) => {
+                notes.push(format!(
+                    "providers and routes added in the dashboard no longer fit this config and are paused: {e:#}"
+                ));
+                cfg
+            }
+        };
+        let rt = Runtime::build(effective, &self.http, Some(&old))?;
         self.keys.set_config(&rt.cfg.keys);
         self.rules.set_config(&rt.cfg.routing_rules);
+        *self.base_cfg.write() = Arc::new(base);
         *self.rt.write() = Arc::new(rt);
         metrics::counter!("gateway_config_reloads_total").increment(1);
         tracing::info!(path = %path, "configuration reloaded");
@@ -276,6 +369,12 @@ pub fn admin_api_router(state: Arc<AppState>) -> Router {
         .route("/api/audit", get(admin::audit_log))
         .route("/api/config", get(admin::get_config))
         .route("/api/reload", post(admin::reload))
+        .route("/api/providers", get(admin::list_providers))
+        .route("/api/providers/:name", axum::routing::put(admin::put_provider).delete(admin::delete_provider))
+        .route("/api/routes", get(admin::list_routes))
+        .route("/api/routes/:name", axum::routing::put(admin::put_route).delete(admin::delete_route))
+        .route("/api/models", get(admin::list_models))
+        .route("/api/models/refresh", post(admin::refresh_models))
         .route("/api/pricing", get(admin::pricing_status))
         .route("/api/pricing/refresh", post(admin::refresh_pricing))
         .route("/healthz", get(healthz))

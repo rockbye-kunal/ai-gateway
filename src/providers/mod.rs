@@ -187,6 +187,36 @@ impl Provider {
         Ok(rb.headers(self.extra_headers.clone()))
     }
 
+    /// Requests that list this provider's models, where it has such an API.
+    /// None for Azure (deployments are not listed with a data-plane key) and
+    /// Vertex (no model list endpoint for publisher models).
+    pub fn list_models(&self, key: &str) -> Option<Result<Vec<RequestBuilder>, ApiError>> {
+        let base = self.base();
+        let get = |url: String| self.authed(self.client.get(url).timeout(Duration::from_secs(15)), key);
+        match self.cfg.kind {
+            ProviderKind::Openai => Some(get(format!("{base}/models")).map(|r| vec![r])),
+            ProviderKind::Anthropic => Some(
+                get(format!("{base}/models?limit=1000"))
+                    .map(|r| vec![r.header("anthropic-version", anthropic::API_VERSION)]),
+            ),
+            ProviderKind::Bedrock => {
+                // The control-plane API lives on bedrock.<region>, next to
+                // bedrock-runtime.<region>.
+                let control = base.replacen("://bedrock-runtime.", "://bedrock.", 1);
+                Some(
+                    [
+                        format!("{control}/foundation-models?byOutputModality=TEXT"),
+                        format!("{control}/inference-profiles?maxResults=1000"),
+                    ]
+                    .into_iter()
+                    .map(get)
+                    .collect(),
+                )
+            }
+            ProviderKind::Azure | ProviderKind::Vertex => None,
+        }
+    }
+
     /// Builds the upstream request for a chat completion (translated for
     /// Anthropic).
     pub fn build(

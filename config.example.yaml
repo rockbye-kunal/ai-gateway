@@ -95,11 +95,21 @@ routing_rules:
 #   webhook_secret: ${ALERT_SECRET}
 #   thresholds: [0.8, 1.0]
 
-# Every request goes through OpenRouter unless it names a route below.
-# Clients pick any OpenRouter model per request, e.g. "openai/gpt-4o-mini",
-# "anthropic/claude-haiku-4.5", "google/gemini-2.5-flash",
-# "meta-llama/llama-3.3-70b-instruct". See https://openrouter.ai/models
+# Every request goes through OpenRouter unless it names a route below or a
+# provider that has its own key. Clients pick any OpenRouter model per request,
+# e.g. "openai/gpt-4o-mini", "anthropic/claude-haiku-4.5",
+# "google/gemini-2.5-flash", "meta-llama/llama-3.3-70b-instruct".
+# See https://openrouter.ai/models
 default_provider: openrouter
+
+# Built-in providers: openai, anthropic, google, mistral, deepseek, xai, groq,
+# together, fireworks, cerebras, perplexity and openrouter work as
+# "<name>/<model>" as soon as their key is set (OPENAI_API_KEY, ANTHROPIC_API_KEY,
+# GROQ_API_KEY, ...), added in the dashboard, or sent by the client. Bedrock and
+# Vertex join from AWS_REGION + AWS credentials and GOOGLE_CLOUD_PROJECT.
+# Providers below override built-in ones of the same name. Set to false to use
+# only the providers listed here and in the dashboard.
+# auto_providers: true
 
 providers:
   openrouter:

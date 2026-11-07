@@ -105,7 +105,11 @@ async fn connect(
     let targets = plan_targets(app, &rt, &tenant, &model, &opts, Endpoint::Chat, zdr)?;
     let target = targets
         .iter()
-        .find(|t| rt.providers.get(&t.provider).is_some_and(|p| p.cfg.kind == ProviderKind::Openai))
+        .find(|t| {
+            rt.providers.get(&t.provider).is_some_and(|p| {
+                p.cfg.kind == ProviderKind::Openai && crate::proxy::provider_ready(app, p, Some(&opts))
+            })
+        })
         .ok_or_else(|| {
             ApiError::bad_request(format!("model '{model}' is not served by an OpenAI-compatible provider"))
         })?;
