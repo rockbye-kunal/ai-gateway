@@ -130,6 +130,7 @@
   const PAGES = [
     ["overview", "Overview"],
     ["logs", "Requests"],
+    ["models", "Models"],
     ["reports", "Usage reports"],
     ["keys", "API keys"],
     ["rules", "Routing rules"],
@@ -660,32 +661,80 @@
   }
 
   // ---------- providers & routes ----------
+  const KIND_LABEL = { openai: "OpenAI-compatible", anthropic: "Anthropic", azure: "Azure OpenAI", bedrock: "AWS Bedrock", vertex: "Google Vertex AI" };
+  const SOURCE_LABEL = { config: "Config file", builtin: "Built in", dashboard: "Dashboard" };
+  const STRATEGY_LABEL = { fallback: "In order", weighted: "Weighted split", latency: "Fastest first", cost: "Cheapest first" };
+
   async function renderSetup() {
     charts = [];
     const main = shell(el("div", { class: "empty", text: "Loading…" }));
-    let c;
-    try { c = await api("/api/config"); } catch (e) { return handleError(e, main); }
-    const providers = el("div", { class: "cards" }, c.providers.map((p) =>
+    let c, provs, routesRes;
+    try {
+      [c, provs, routesRes] = await Promise.all([api("/api/config"), api("/api/providers"), api("/api/routes")]);
+    } catch (e) { return handleError(e, main); }
+    let pricing = null;
+    try { pricing = await api("/api/pricing"); } catch (_) {}
+    const health = Object.fromEntries(c.providers.map((p) => [p.name, p]));
+    const storage = provs.storage_enabled;
+
+    const keyText = (p) => ({
+      stored: "Stored here " + p.key_hint,
+      environment: "Environment " + p.key_hint,
+      config: "Config file " + p.key_hint,
+      cloud: "Cloud credentials",
+      none: "No key",
+    })[p.key];
+    const provRow = (p) => {
+      const h = health[p.name];
+      const status = p.error ? el("span", { class: "pill err", title: p.error, text: "Not applied" })
+        : !p.ready ? el("span", { class: "pill", text: "Needs a key" })
+        : h && h.circuit_open ? el("span", { class: "pill err", text: "Circuit open" })
+        : el("span", { class: "pill ok", text: "Ready" });
+      return el("tr", {},
+        el("td", {}, el("div", {}, el("strong", { text: p.name }), p.default ? el("span", { class: "pill", style: "margin-left:6px", text: "Default" }) : null),
+          p.label ? el("div", { class: "sub", text: p.label }) : null),
+        el("td", {}, el("div", { text: KIND_LABEL[p.kind] || p.kind || "–" }),
+          p.error ? el("div", { class: "sub", style: "color:var(--error)", text: p.error })
+            : el("div", { class: "sub trunc", title: p.base_url, text: p.base_url })),
+        el("td", { text: keyText(p) }),
+        el("td", {}, status),
+        el("td", { text: SOURCE_LABEL[p.source] || p.source }),
+        el("td", { class: "actions-cell" },
+          storage && p.kind !== "bedrock" && p.kind !== "vertex"
+            ? el("button", { class: "btn", type: "button", text: p.key === "none" ? "Add key" : "Replace key", onclick: () => setProviderKey(p.name) }) : null, " ",
+          p.key === "stored" && p.source !== "dashboard"
+            ? el("button", { class: "btn danger", type: "button", text: "Remove key", onclick: () => removeProviderKey(p.name) }) : null,
+          p.source === "dashboard"
+            ? el("button", { class: "btn danger", type: "button", text: "Remove", onclick: () => removeProvider(p.name) }) : null));
+    };
+    const provTable = (rows) => el("table", {},
+      el("thead", {}, el("tr", {}, ["Provider", "Type and endpoint", "Key", "Status", "Defined in", ""].map((h) => el("th", { text: h })))),
+      el("tbody", {}, rows.map(provRow)));
+    const ready = provs.data.filter((p) => p.ready || p.error);
+    const waiting = provs.data.filter((p) => !p.ready && !p.error);
+    const providersPanel = el("section", { class: "panel flush" },
+      el("div", { class: "page-head", style: "padding:12px 16px 0;margin:0" },
+        el("div", {}, el("h2", { style: "padding:0", text: "Providers" }),
+          el("div", { class: "sub", text: "Call any of them as provider/model. Built-in providers turn on when they have a key: from their environment variable, added here, or sent by the client." })),
+        el("button", { class: "btn primary", type: "button", text: "Add provider", onclick: () => openProviderForm(storage) })),
+      el("div", { class: "table-wrap" }, ready.length ? provTable(ready) : el("div", { class: "empty", text: "No provider has a key yet. Add one here or set its environment variable." })),
+      waiting.length ? el("details", { class: "more" },
+        el("summary", { text: waiting.length + " more built-in provider" + (waiting.length > 1 ? "s" : "") + " without a key" }),
+        el("div", { class: "table-wrap" }, provTable(waiting))) : null,
+      storage ? null : el("p", { class: "sub", style: "padding:0 16px 12px", text: "Set admin.encryption_key in the config to add provider keys here." }));
+
+    const healthCards = c.providers.filter((p) => p.targets.length).map((p) =>
       el("div", { class: "prov" },
         el("div", { class: "name" }, el("span", { text: p.name }),
           el("span", { class: "pill " + (p.circuit_open ? "err" : "ok"), text: p.circuit_open ? "Circuit open" : "Healthy" })),
-        el("div", { class: "meta", text: p.kind + " at " + p.base_url }),
-        el("div", { class: "meta", text: p.timeout_secs + " s timeout, " + p.max_retries + " retries" }),
-        el("div", { class: "meta", text: "APIs: " + p.endpoints.join(", ") }),
-        el("div", {}, p.zero_data_retention ? el("span", { class: "pill", text: "ZDR" }) : null, " ",
-          p.no_prompt_training ? el("span", { class: "pill", text: "No training" }) : null, " ",
-          p.auto_prompt_cache ? el("span", { class: "pill", text: "Auto prompt cache" }) : null),
-        p.targets.length ? el("table", { class: "mini" },
+        el("div", { class: "meta", text: p.timeout_secs + " s timeout, " + p.max_retries + " retries. APIs: " + p.endpoints.join(", ") }),
+        el("table", { class: "mini" },
           el("tbody", {}, p.targets.slice(0, 6).map((t) => el("tr", {},
             el("td", { class: "trunc", text: t.target }),
             el("td", { class: "num", text: t.ttft_ms ? ms(t.ttft_ms) : "–" }),
             el("td", { class: "num", title: "Output tokens per second", text: t.tokens_per_sec ? Math.round(t.tokens_per_sec) + " t/s" : "–" }),
-            el("td", { class: "num", title: "Success rate", text: Math.round(t.success_rate * 100) + "%" })))))
-          : el("div", { class: "meta", text: "No traffic on this replica yet." }))));
-    let keys = null;
-    try { keys = await api("/api/provider-keys"); } catch (_) {}
-    let pricing = null;
-    try { pricing = await api("/api/pricing"); } catch (_) {}
+            el("td", { class: "num", title: "Success rate", text: Math.round(t.success_rate * 100) + "%" })))))));
+
     const per = (v) => v === null || v === undefined ? "–" : "$" + (+v.toFixed(4));
     const prices = pricing ? el("section", { class: "panel flush", style: "margin-top:20px" },
       el("div", { class: "page-head", style: "padding:12px 16px 0;margin:0" },
@@ -703,22 +752,18 @@
           el("td", { class: "num", text: t.price ? per(t.price.cached_input_per_mtok) : "–" }),
           el("td", { text: ({ route: "Route config", override: "Override", list: "Price list" })[t.source] || "Unknown, no cost recorded" })))))
         : el("div", { class: "empty", text: "No routes to price." }))) : null;
-    const byok = keys ? el("section", { class: "panel flush" }, el("h2", { text: "Provider keys" }),
-      el("p", { class: "sub", style: "padding:0 16px", text: keys.storage_enabled ? "Keys stored here are encrypted and replace the config file key on every replica within seconds." : "Set admin.encryption_key to store provider keys here instead of in the config file." }),
-      el("div", { class: "table-wrap" }, el("table", {},
-        el("thead", {}, el("tr", {}, ["Provider", "Key in use", "Clients may bring keys", ""].map((h) => el("th", { text: h })))),
-        el("tbody", {}, keys.data.map((k) => el("tr", {},
-          el("td", { text: k.provider }),
-          el("td", { text: k.hint ? (k.source === "stored" ? "Stored here " : "Config file ") + k.hint : "Cloud credentials (AWS or Google)" }),
-          el("td", { text: k.allow_client_keys ? "Yes" : "No" }),
-          el("td", {}, keys.storage_enabled ? el("button", { class: "btn", type: "button", text: "Replace key", onclick: () => setProviderKey(k.provider) }) : null, " ",
-            k.source === "stored" ? el("button", { class: "btn danger", type: "button", text: "Remove", onclick: () => removeProviderKey(k.provider) }) : null))))))) : null;
-    const routes = c.routes.length ? el("table", {},
-      el("thead", {}, el("tr", {}, ["Route", "Strategy", "Targets, in fallback order"].map((h) => el("th", { text: h })))),
-      el("tbody", {}, c.routes.map((r) => el("tr", {},
-        el("td", { text: r.name }),
-        el("td", { text: ({ weighted: "Weighted split", latency: "Fastest first", cost: "Cheapest first", fallback: "First healthy" })[r.strategy] + (r.branches.length ? ", " + r.branches.length + " conditional branch" + (r.branches.length > 1 ? "es" : "") : "") }),
-        el("td", { class: "trunc", text: r.targets.map((t) => t.provider + "/" + t.model + (r.strategy === "weighted" ? " (" + (t.weight === null ? 1 : t.weight) + ")" : "")).join("  ›  ") })))))
+
+    const routes = routesRes.data.length ? el("table", {},
+      el("thead", {}, el("tr", {}, ["Route", "Strategy", "Targets, in fallback order", "Defined in", ""].map((h) => el("th", { text: h })))),
+      el("tbody", {}, routesRes.data.map((r) => el("tr", {},
+        el("td", {}, el("div", { text: r.name }), r.error ? el("div", { class: "sub", style: "color:var(--error)", text: "Not applied: " + r.error }) : null),
+        el("td", { text: (STRATEGY_LABEL[r.strategy] || r.strategy || "In order") + ((r.branches || []).length ? ", " + r.branches.length + " conditional branch" + (r.branches.length > 1 ? "es" : "") : "") }),
+        el("td", { class: "trunc", text: (r.targets || []).map((t) => t.provider + "/" + t.model + (r.strategy === "weighted" ? " (" + (t.weight === undefined ? 1 : t.weight) + ")" : "")).join("  ›  ") }),
+        el("td", { text: SOURCE_LABEL[r.source] }),
+        el("td", { class: "actions-cell" }, r.source === "dashboard" ? [
+          r.error ? null : el("button", { class: "btn", type: "button", text: "Edit", onclick: () => openRouteForm(provs.data, r) }), " ",
+          el("button", { class: "btn danger", type: "button", text: "Delete", onclick: () => removeRoute(r.name) }),
+        ] : null)))))
       : el("div", { class: "empty", text: "No routes. Clients call provider/model directly." });
     const guards = c.guardrails.length ? el("table", {},
       el("thead", {}, el("tr", {}, ["Rule", "Action", "Checks"].map((h) => el("th", { text: h })))),
@@ -728,22 +773,132 @@
       : el("div", { class: "empty", text: "No guardrail rules. Add them under guardrails.rules in the config." });
     main.replaceChildren(
       el("div", { class: "page-head" }, el("div", {}, el("h1", { text: "Providers & routes" }),
-        el("div", { class: "sub", text: "Version " + c.version + ", " + c.store + " store. Defined in the config file." })),
+        el("div", { class: "sub", text: "Version " + c.version + ", " + c.store + " store. Changes made here reach every replica within seconds." })),
         c.reloadable ? el("button", { class: "btn", type: "button", text: "Reload config file", onclick: reloadConfig }) : null),
-      el("h2", { text: "Providers" }), providers,
-      byok ? el("div", { style: "margin-top:20px" }, byok) : null,
-      el("div", { class: "grid2" },
-        el("section", { class: "panel flush" }, el("h2", { text: "Routes" }), el("div", { class: "table-wrap" }, routes),
-          c.default_provider ? el("p", { class: "sub", style: "padding: 0 16px 12px", text: "Any other model goes to " + c.default_provider + "." }) : null),
-        el("section", { class: "panel flush" }, el("h2", { text: "Guardrails" }), el("div", { class: "table-wrap" }, guards))),
-      prices,
-      el("dl", { class: "kv", style: "margin-top: 20px" },
-        el("dt", { text: "Response cache" }), el("dd", { text: c.cache.enabled ? "On, " + c.cache.ttl_secs + " s" : "Off" }),
-        el("dt", { text: "Request log" }), el("dd", { text: c.logging.enabled ? "Last " + num(c.logging.max_entries) + " requests" : "Off" }),
-        el("dt", { text: "Prompt capture" }), el("dd", { text: c.logging.capture_bodies ? "On" : "Off" }),
-        el("dt", { text: "Log export" }), el("dd", { text: c.logging.export || "Off" }),
-        el("dt", { text: "OpenTelemetry" }), el("dd", { text: c.logging.otlp || "Off" }),
-        el("dt", { text: "Alerts webhook" }), el("dd", { text: c.alerts ? "On" : "Off" })));
+      providersPanel,
+      el("section", { class: "panel flush", style: "margin-top:20px" },
+        el("div", { class: "page-head", style: "padding:12px 16px 0;margin:0" },
+          el("div", {}, el("h2", { style: "padding:0", text: "Routes" }),
+            el("div", { class: "sub", text: "A route is a model name of your own with fallbacks." + (c.default_provider ? " Any model that isn't a route or provider/model goes to " + c.default_provider + "." : "") })),
+          el("button", { class: "btn primary", type: "button", text: "Add route", onclick: () => openRouteForm(provs.data, null) })),
+        el("div", { class: "table-wrap" }, routes)),
+      healthCards.length ? el("div", { style: "margin-top:20px" }, el("h2", { text: "Provider health on this replica" }), el("div", { class: "cards" }, healthCards)) : "",
+      el("div", { class: "grid2", style: "margin-top:20px" },
+        el("section", { class: "panel flush" }, el("h2", { text: "Guardrails" }), el("div", { class: "table-wrap" }, guards)),
+        el("dl", { class: "kv" },
+          el("dt", { text: "Response cache" }), el("dd", { text: c.cache.enabled ? "On, " + c.cache.ttl_secs + " s" : "Off" }),
+          el("dt", { text: "Request log" }), el("dd", { text: c.logging.enabled ? "Last " + num(c.logging.max_entries) + " requests" : "Off" }),
+          el("dt", { text: "Prompt capture" }), el("dd", { text: c.logging.capture_bodies ? "On" : "Off" }),
+          el("dt", { text: "Log export" }), el("dd", { text: c.logging.export || "Off" }),
+          el("dt", { text: "OpenTelemetry" }), el("dd", { text: c.logging.otlp || "Off" }),
+          el("dt", { text: "Alerts webhook" }), el("dd", { text: c.alerts ? "On" : "Off" }))),
+      prices || "");
+  }
+
+  function modalForm(title, fields, submitText, onSubmit) {
+    const err = el("div", { class: "notice err hidden" });
+    const close = () => { scrim.remove(); modal.remove(); };
+    const scrim = el("div", { class: "scrim", onclick: close });
+    const submit = el("button", { class: "btn primary", type: "submit", text: submitText });
+    const form = el("form", {
+      onsubmit: async (e) => {
+        e.preventDefault();
+        submit.disabled = true;
+        try { await onSubmit(); close(); renderSetup(); }
+        catch (x) { err.textContent = x.message; err.classList.remove("hidden"); }
+        submit.disabled = false;
+      },
+    },
+      el("h1", { text: title }), el("div", { class: "form-grid" }, fields), err,
+      el("div", { class: "actions" }, el("button", { class: "btn", type: "button", text: "Cancel", onclick: close }), submit));
+    const modal = el("div", { class: "modal", role: "dialog", "aria-label": title }, form);
+    document.body.append(scrim, modal);
+    const first = form.querySelector("input, select, textarea");
+    if (first) first.focus();
+  }
+
+  function openProviderForm(storage) {
+    const name = el("input", { type: "text", required: true, maxlength: "64", pattern: "[A-Za-z0-9._-]+", autocomplete: "off", placeholder: "my-vllm" });
+    const kind = el("select", {}, Object.entries(KIND_LABEL).map(([v, l]) => el("option", { value: v, text: l })));
+    const base = el("input", { type: "url", placeholder: "https://api.example.com/v1" });
+    const key = el("input", { type: "password", autocomplete: "off", placeholder: storage ? "Stored encrypted" : "Needs admin.encryption_key" , disabled: !storage });
+    const region = el("input", { type: "text", placeholder: "us-east-1 or us-central1" });
+    const project = el("input", { type: "text", placeholder: "my-gcp-project" });
+    const apiVersion = el("input", { type: "text", placeholder: "2024-10-21" });
+    const zdr = el("input", { type: "checkbox" });
+    const f = {
+      base: el("label", { class: "field wide" }, "Base URL", base),
+      key: el("label", { class: "field wide" }, "API key", key),
+      region: el("label", { class: "field" }, "Region", region),
+      project: el("label", { class: "field" }, "Google Cloud project", project),
+      apiVersion: el("label", { class: "field" }, "API version", apiVersion),
+    };
+    const sync = () => {
+      const k = kind.value;
+      f.base.classList.toggle("hidden", k === "bedrock" || k === "vertex");
+      base.required = !(k === "bedrock" || k === "vertex");
+      f.region.classList.toggle("hidden", !(k === "bedrock" || k === "vertex"));
+      f.project.classList.toggle("hidden", k !== "vertex");
+      f.apiVersion.classList.toggle("hidden", k !== "azure");
+      base.placeholder = k === "azure" ? "https://YOUR-RESOURCE.openai.azure.com/openai/deployments" : k === "anthropic" ? "https://api.anthropic.com/v1" : "https://api.example.com/v1";
+    };
+    kind.addEventListener("change", sync);
+    sync();
+    modalForm("Add a provider", [
+      el("label", { class: "field" }, "Name, used as name/model", name),
+      el("label", { class: "field" }, "Type", kind),
+      f.base, f.key, f.region, f.project, f.apiVersion,
+      el("label", { class: "toggle wide" }, zdr, "This provider keeps no data (zero data retention)"),
+      el("p", { class: "sub wide", text: "Bedrock and Vertex use the gateway's AWS or Google credentials. A key entered here is encrypted and never shown again." }),
+    ], "Add provider", async () => {
+      const body = { kind: kind.value, zero_data_retention: zdr.checked || undefined };
+      if (base.value.trim()) body.base_url = base.value.trim();
+      if (key.value.trim()) body.api_key = key.value.trim();
+      if (region.value.trim()) body.region = region.value.trim();
+      if (project.value.trim()) body.project = project.value.trim();
+      if (apiVersion.value.trim()) body.api_version = apiVersion.value.trim();
+      await api("/api/providers/" + encodeURIComponent(name.value.trim()), { method: "PUT", body: JSON.stringify(body) });
+    });
+  }
+
+  function openRouteForm(providers, existing) {
+    const name = el("input", { type: "text", required: true, maxlength: "64", pattern: "[A-Za-z0-9._-]+", autocomplete: "off", placeholder: "assistant", value: existing ? existing.name : "", readonly: !!existing });
+    const strategy = el("select", {}, Object.entries(STRATEGY_LABEL).map(([v, l]) => el("option", { value: v, text: l, selected: existing && existing.strategy === v })));
+    const lines = existing ? existing.targets.map((t) => t.provider + "/" + t.model + (t.weight !== undefined ? " " + t.weight : "")).join("\n") : "";
+    const targets = el("textarea", { rows: "5", required: true, placeholder: "openai/gpt-4o-mini\nanthropic/claude-haiku-4-5\nopenrouter/google/gemini-2.5-flash" });
+    targets.value = lines;
+    const names = providers.filter((p) => p.ready).map((p) => p.name).join(", ");
+    modalForm(existing ? "Edit route " + existing.name : "Add a route", [
+      el("label", { class: "field" }, "Route name, sent as model", name),
+      el("label", { class: "field" }, "Strategy", strategy),
+      el("label", { class: "field wide" }, "Targets, one per line as provider/model, tried in this order. For a weighted split add the weight after a space.", targets),
+      el("p", { class: "sub wide", text: "Providers with a key: " + (names || "none yet") + "." }),
+    ], existing ? "Save route" : "Add route", async () => {
+      const parsed = targets.value.split("\n").map((l) => l.trim()).filter(Boolean).map((l) => {
+        const [target, weight] = l.split(/\s+/);
+        const i = target.indexOf("/");
+        if (i < 1) throw new Error("“" + l + "” should look like provider/model.");
+        const t = { provider: target.slice(0, i), model: target.slice(i + 1) };
+        if (weight !== undefined) t.weight = Number(weight);
+        return t;
+      });
+      if (!parsed.length) throw new Error("Add at least one target.");
+      const body = { strategy: strategy.value, targets: parsed };
+      if (existing && existing.branches && existing.branches.length) body.branches = existing.branches;
+      await api("/api/routes/" + encodeURIComponent(name.value.trim()), { method: "PUT", body: JSON.stringify(body) });
+    });
+  }
+
+  async function removeProvider(name) {
+    if (!confirm("Remove the provider " + name + "? Requests for " + name + "/… then go to the default provider.")) return;
+    try { await api("/api/providers/" + encodeURIComponent(name), { method: "DELETE" }); } catch (e) { alert(e.message); return; }
+    renderSetup();
+  }
+
+  async function removeRoute(name) {
+    if (!confirm("Delete the route " + name + "? Clients sending it as the model will get an error or reach the default provider.")) return;
+    try { await api("/api/routes/" + encodeURIComponent(name), { method: "DELETE" }); } catch (e) { alert(e.message); return; }
+    renderSetup();
   }
 
   async function reloadConfig() {
@@ -760,7 +915,7 @@
   }
 
   async function setProviderKey(provider) {
-    const key = prompt("New API key for " + provider + ". It is encrypted and never shown again.");
+    const key = prompt("API key for " + provider + ". It is encrypted and never shown again.");
     if (!key) return;
     try { await api("/api/provider-keys/" + encodeURIComponent(provider), { method: "PUT", body: JSON.stringify({ api_key: key }) }); }
     catch (e) { alert(e.message); return; }
@@ -768,9 +923,57 @@
   }
 
   async function removeProviderKey(provider) {
-    if (!confirm("Remove the stored key for " + provider + "? The key in the config file is used again.")) return;
+    if (!confirm("Remove the stored key for " + provider + "? Its key from the config file or environment is used again, if it has one.")) return;
     try { await api("/api/provider-keys/" + encodeURIComponent(provider), { method: "DELETE" }); } catch (e) { alert(e.message); return; }
     renderSetup();
+  }
+
+  // ---------- models ----------
+  async function renderModels(force) {
+    charts = [];
+    const main = shell(el("div", { class: "empty", text: force ? "Asking every provider for its models…" : "Loading…" }));
+    let res;
+    try { res = await api(force ? "/api/models/refresh" : "/api/models", force ? { method: "POST" } : undefined); }
+    catch (e) { return handleError(e, main); }
+    const search = el("input", { type: "search", placeholder: "Search models", "aria-label": "Search models", value: state.modelSearch || "" });
+    const provider = el("select", { "aria-label": "Provider" }, el("option", { value: "", text: "All providers" }),
+      res.providers.map((p) => el("option", { value: p.provider, selected: state.modelProvider === p.provider, text: p.provider + " (" + num(p.models) + ")" })));
+    const per = (v) => v === null || v === undefined ? "–" : "$" + (+v.toFixed(4));
+    const host = el("div");
+    const LIMIT = 500;
+    const draw = () => {
+      state.modelSearch = search.value; state.modelProvider = provider.value;
+      const q = search.value.trim().toLowerCase();
+      const rows = res.data.filter((m) => (!provider.value || m.owned_by === provider.value)
+        && (!q || m.id.toLowerCase().includes(q) || (m.name || "").toLowerCase().includes(q)));
+      host.replaceChildren(
+        el("section", { class: "panel flush" }, el("div", { class: "table-wrap" }, rows.length ? el("table", {},
+          el("thead", {}, el("tr", {}, ["Model, as clients send it", "Name", "Context", "Input / M", "Output / M", "Price from"].map((h, i) => el("th", { class: i >= 2 && i <= 4 ? "num" : null, text: h })))),
+          el("tbody", {}, rows.slice(0, LIMIT).map((m) => {
+            const copy = el("button", { class: "link", type: "button", title: "Copy model name", text: m.id,
+              onclick: async () => { try { await navigator.clipboard.writeText(m.id); copy.textContent = "Copied"; setTimeout(() => { copy.textContent = m.id; }, 900); } catch (_) {} } });
+            return el("tr", {},
+              el("td", {}, copy),
+              el("td", { class: "trunc", text: m.name || "–" }),
+              el("td", { class: "num", text: m.context_length ? compact(m.context_length) : "–" }),
+              el("td", { class: "num", text: per(m.pricing.input_per_mtok) }),
+              el("td", { class: "num", text: per(m.pricing.output_per_mtok) }),
+              el("td", { text: ({ list: "Price list", provider: "Provider", override: "Override", route: "Route config" })[m.pricing.source] || "Unknown" }));
+          })))
+          : el("div", { class: "empty", text: res.data.length ? "No model matches." : "No provider with a model list has a key yet. Add one on the Providers & routes page." }))),
+        rows.length > LIMIT ? el("p", { class: "sub", text: "Showing " + LIMIT + " of " + num(rows.length) + ". Search to narrow the list." }) : "");
+    };
+    search.addEventListener("input", draw);
+    provider.addEventListener("change", draw);
+    const problems = res.providers.filter((p) => p.error);
+    main.replaceChildren(
+      el("div", { class: "page-head" }, el("div", {}, el("h1", { text: "Models" }),
+        el("div", { class: "sub", text: num(res.data.length) + " models from " + res.providers.filter((p) => p.models).length + " providers, from each provider's own list. Clients get the models their key may use from GET /v1/models." })),
+        el("button", { class: "btn", type: "button", text: "Refresh lists", onclick: () => renderModels(true) })),
+      problems.length ? el("div", { class: "notice err" }, problems.map((p) => el("div", { text: p.provider + ": " + p.error + (p.models ? " (showing the last list)" : "") }))) : "",
+      el("div", { class: "filters" }, search, provider),
+      host);
+    draw();
   }
 
   // ---------- routing rules ----------
@@ -912,7 +1115,7 @@
     const page = (location.hash || "#overview").slice(1);
     state.page = PAGES.some(([id]) => id === page) ? page : "overview";
     if (!state.token) { renderLogin(); return; }
-    ({ overview: renderOverview, logs: renderLogs, reports: renderReports, keys: renderKeys, rules: renderRules, limits: renderLimits, setup: renderSetup, audit: renderAudit })[state.page]();
+    ({ overview: renderOverview, logs: renderLogs, models: () => renderModels(false), reports: renderReports, keys: renderKeys, rules: renderRules, limits: renderLimits, setup: renderSetup, audit: renderAudit })[state.page]();
   }
   window.addEventListener("hashchange", route);
   route();

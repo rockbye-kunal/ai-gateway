@@ -207,6 +207,12 @@ async fn handle(
         None => path.to_string(),
     };
 
+    if !crate::proxy::provider_ready(app, &provider, Some(&opts)) {
+        return Err(ApiError::unavailable(format!(
+            "provider '{}' has no API key; add one in the dashboard or its environment variable",
+            provider.name
+        )));
+    }
     let (key, credential) = credentials(app, &provider, &opts);
     let attempts = opts.max_attempts.unwrap_or(provider.cfg.max_retries + 1).max(1);
     let mut last_error =

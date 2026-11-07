@@ -93,7 +93,7 @@ h2 { font-size: 15px; font-weight: 600; margin: 0 0 10px; }
 .btn.primary { background: var(--traffic); border-color: var(--traffic); color: #fff; }
 .btn.danger { color: var(--error); border-color: var(--error); background: transparent; }
 .btn:disabled { opacity: .5; cursor: default; }
-input[type=text], input[type=number], input[type=password], input[type=search], input[type=date], select {
+input[type=text], input[type=url], input[type=number], input[type=password], input[type=search], input[type=date], select {
   border: 1px solid var(--rule-strong); background: var(--surface); border-radius: var(--radius-s); padding: 6px 9px;
   min-width: 0;
 }
@@ -215,6 +215,12 @@ table.mini td.num { white-space: nowrap; }
   .filters input[type=search] { width: 100%; }
   dl.kv { grid-template-columns: 1fr; }
 }
+.actions-cell { white-space: nowrap; text-align: right; }
+details.more { border-top: 1px solid var(--rule); }
+details.more summary { cursor: pointer; padding: 10px 16px; color: var(--muted); font-size: 13px; }
+details.more[open] summary { border-bottom: 1px solid var(--rule); }
+textarea { font: inherit; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; color: var(--ink); background: var(--surface); border: 1px solid var(--rule-strong); border-radius: var(--radius-s); padding: 8px; width: 100%; resize: vertical; }
+td button.link { background: none; border: 0; padding: 0; cursor: pointer; color: var(--traffic); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; text-align: left; }
 </style>
 </head>
 <body>

@@ -29,14 +29,14 @@ AI Gateway is open source under the MIT or Apache-2.0 licence, at your option. I
 
 | Area | What you get |
 |---|---|
-| **APIs** | OpenAI Chat Completions (with streaming), Responses, Embeddings, Images, Moderations, Rerank, Audio speech and Realtime (WebSockets); Anthropic Messages; `/native/<provider>/<path>` passthrough for any other provider endpoint; `/v1/models` |
-| **Providers** | Any OpenAI-compatible API (OpenAI, Gemini, Groq, Together, Mistral, vLLM, Ollama, OpenRouter…), Azure OpenAI, Anthropic, AWS Bedrock (Converse API, SigV4 signing, every AWS credential source) and Google Vertex AI (Gemini and partner models, Claude in Anthropic's format). Anthropic and Bedrock are translated to and from the OpenAI format, including tools, images and streaming |
+| **APIs** | OpenAI Chat Completions (with streaming), Responses, Embeddings, Images, Moderations, Rerank, Audio speech and Realtime (WebSockets); Anthropic Messages; `/native/<provider>/<path>` passthrough for any other provider endpoint; `/v1/models` with every model your providers offer, fetched live, with prices |
+| **Providers** | Twelve providers built in and enabled by their API key alone (OpenAI, Anthropic, Google Gemini, Mistral, DeepSeek, xAI, Groq, Together, Fireworks, Cerebras, Perplexity, OpenRouter), plus Bedrock and Vertex from your cloud credentials; add more in the dashboard or the config file. Any OpenAI-compatible API (OpenAI, Gemini, Groq, Together, Mistral, vLLM, Ollama, OpenRouter…), Azure OpenAI, Anthropic, AWS Bedrock (Converse API, SigV4 signing, every AWS credential source) and Google Vertex AI (Gemini and partner models, Claude in Anthropic's format). Anthropic and Bedrock are translated to and from the OpenAI format, including tools, images and streaming |
 | **Routing** | Named routes with fallbacks, weighted A/B splits with session affinity, fastest-first and cheapest-first strategies, conditional branches on key, user, tags or metadata, per-request fallback models, provider `order`/`only`/`sort`, and model rewrite and deny rules you can change live |
 | **Reliability** | Retries with configurable backoff, per-provider and per-request timeouts, stream idle timeout, circuit breakers with alerts, fallback on 5xx, timeouts, 429 and rejected credentials |
 | **Cost** | Costs worked out automatically from a public price list (LiteLLM's, refreshed daily, or a local file), including prompt-cache read and write rates; your own prices and overrides take priority |
 | **Limits and spend** | Per-key requests per minute and token budgets; request, token and dollar limits per minute, hour, day, week or month, split by key, user, model, provider or any metadata field; signed webhook alerts at thresholds |
 | **Caching** | Exact-match cache for normal and streaming responses, per key, with per-request TTL, skip and custom cache key; automatic Anthropic prompt caching |
-| **Security** | Hashed client keys, keys and routing rules managed live, bring-your-own provider keys (per request, or stored encrypted), zero data retention and no-training filters, guardrails and DLP (regex detectors and moderation models), audit log |
+| **Security** | Hashed client keys; keys, providers, routes and routing rules managed live from the dashboard; bring-your-own provider keys (per request, or stored encrypted), zero data retention and no-training filters, guardrails and DLP (regex detectors and moderation models), audit log |
 | **Observability** | Request log with every provider attempt, tokens (cached and reasoning too), cost, time to first token, tokens per second, user, tags, metadata and feedback; optional prompts and responses; usage reports; NDJSON log export; OpenTelemetry traces; Prometheus metrics |
 | **Operations** | Web dashboard, admin API, hot config reload (SIGHUP or API), `/healthz` and `/readyz`, graceful shutdown that lets streams finish and flushes usage writes |
 
@@ -77,14 +77,27 @@ cargo build --release
 ./target/release/ai-gateway generate-key              # the admin token for the dashboard
 ./target/release/ai-gateway generate-encryption-key   # optional: lets the dashboard store provider keys
 
-# 2. Configure
-cp config.example.yaml config.yaml                    # then edit providers, routes and keys
-export OPENROUTER_API_KEY=... REDIS_URL=rediss://... ADMIN_TOKEN_SHA256=...
-./target/release/ai-gateway check-config config.yaml
+# 2. Configure (see below)
 
-# 3. Run
+# 3. Give it provider keys and run
+export OPENROUTER_API_KEY=sk-or-...   # and/or OPENAI_API_KEY, ANTHROPIC_API_KEY, GROQ_API_KEY, ...
+./target/release/ai-gateway check-config config.yaml
 ./target/release/ai-gateway serve config.yaml
 ```
+
+A minimal `config.yaml` is enough:
+
+```yaml
+admin:
+  token_sha256: "<key_sha256 of the admin token>"
+default_provider: openrouter      # any model name not matched otherwise goes here
+keys:
+  - name: my-app
+    key_sha256: "<key_sha256 of the client key>"
+    allowed_models: ["*"]
+```
+
+No `providers:` section is needed: each [built-in provider](#providers) turns on when its key is in the environment, and you can add keys, providers and routes later in the dashboard. `config.example.yaml` shows every setting.
 
 The client API listens on `0.0.0.0:8080` and the dashboard and admin API on `127.0.0.1:9090` (change them under `server:`). Open `http://localhost:9090/` and sign in with the admin token.
 
@@ -117,6 +130,33 @@ Response headers tell you what happened: `x-request-id` (also `x-gateway-generat
 Everything is in one YAML file; `config.example.yaml` is a commented starting point. `${VAR}` is replaced with the environment variable `VAR`. Most changes take effect with a [reload](#reloading-configuration), no restart needed.
 
 ### Providers
+
+Models are dynamic: clients can call any model a provider offers, by name, and nothing needs to be listed in the config. A provider becomes available in one of three ways.
+
+**Built in.** These providers are known to the gateway and turn on as soon as they have a key: from the environment variable below, from a key added in the dashboard, or from a key the client sends with the request (`providerOptions.gateway.byok`). Until then their models go to `default_provider`. `<NAME>_BASE_URL` (for example `OPENAI_BASE_URL`) points one somewhere else; it must be https, or http to localhost, or that provider is left out. `auto_providers: false` turns the list off.
+
+Because of this, setting `ANTHROPIC_API_KEY` in the gateway's environment moves `anthropic/...` requests from `default_provider` to Anthropic directly. Send `openrouter/anthropic/claude-sonnet-4.5` when you want OpenRouter regardless.
+
+| Name | Provider | Key from |
+|---|---|---|
+| `openai` | OpenAI | `OPENAI_API_KEY` |
+| `anthropic` | Anthropic | `ANTHROPIC_API_KEY` |
+| `google` | Google Gemini API | `GEMINI_API_KEY` or `GOOGLE_GENERATIVE_AI_API_KEY` |
+| `mistral` | Mistral | `MISTRAL_API_KEY` |
+| `deepseek` | DeepSeek | `DEEPSEEK_API_KEY` |
+| `xai` | xAI | `XAI_API_KEY` |
+| `groq` | Groq | `GROQ_API_KEY` |
+| `together` | Together AI | `TOGETHER_API_KEY` |
+| `fireworks` | Fireworks AI | `FIREWORKS_API_KEY` |
+| `cerebras` | Cerebras | `CEREBRAS_API_KEY` |
+| `perplexity` | Perplexity | `PERPLEXITY_API_KEY` |
+| `openrouter` | OpenRouter | `OPENROUTER_API_KEY` |
+| `bedrock` | AWS Bedrock | `AWS_REGION` plus AWS credentials in the environment (keys, web identity, ECS role or `AWS_BEARER_TOKEN_BEDROCK`) |
+| `vertex` | Google Vertex AI | `GOOGLE_CLOUD_PROJECT` (and `GOOGLE_CLOUD_LOCATION`), with Google credentials |
+
+**From the dashboard.** On **Providers & routes → Add provider**, give any OpenAI-compatible, Anthropic, Azure, Bedrock or Vertex endpoint a name, URL and key. It reaches every replica within seconds. Keys are encrypted with `admin.encryption_key`. Changing a provider's URL needs its key again, so a key is never sent to a host it wasn't given for, and Bedrock and Vertex endpoints always come from their region. An entry that stops fitting the config (say, a route whose provider was removed) is skipped, shown with the reason, and can be deleted; the rest keep working.
+
+**In the config file**, for settings you want in version control. A provider here wins over a built-in one of the same name:
 
 ```yaml
 providers:
@@ -164,9 +204,11 @@ Other provider settings: `stream_idle_timeout_secs`, `breaker_failure_threshold`
 
 The `model` a client sends can be:
 
-- a **route name** from the config (`smart`), which brings its fallbacks and strategy;
-- `provider/model` for a configured provider (`openai/gpt-4o`, `anthropic/claude-sonnet-4.5`);
-- anything else, sent unchanged to `default_provider` (for example any OpenRouter model).
+- a **route name** (`smart`), from the config or the dashboard, which brings its fallbacks and strategy;
+- `provider/model` for any provider that has a key (`openai/gpt-4o`, `groq/llama-3.3-70b-versatile`, `openrouter/anthropic/claude-sonnet-4.5`);
+- anything else, sent unchanged to `default_provider`. With OpenRouter as the default, `anthropic/claude-sonnet-4.5` reaches Claude through OpenRouter until you add an Anthropic key.
+
+`GET /v1/models` lists all of these for the calling key: the routes, then every model of every provider with a key, asked from the providers themselves (OpenAI-compatible `/models`, Anthropic's model list, Bedrock's foundation models and inference profiles) and cached for an hour, with prices. Add `?provider=groq` for one provider. Vertex has no model list API, so its models don't appear there, but they can still be called by name.
 
 Each key lists what it may use in `allowed_models`: route names, `provider/model`, `provider/*`, or `*`.
 
@@ -197,6 +239,8 @@ routes:
 - `latency` puts the target with the fastest recent time to first token first. Untried targets go first so they get measured, and 5% of requests try the runner-up to keep measurements fresh.
 - `cost` puts the cheapest target first, using the same prices as [cost tracking](#model-prices); targets with no known price go last.
 - Branch conditions can use `key`, `user`, `tags` and `metadata.<name>`.
+
+Routes can also be created and edited in the dashboard (**Providers & routes → Add route**) or with `PUT /api/routes/{name}`, which takes the same shape as above. A target whose provider has no key is skipped and the next one is tried.
 
 Routing rules rewrite or deny models before routing, and apply to fallbacks too. Put them in the config, or manage them live from the dashboard (`/api/rules`):
 
@@ -332,7 +376,7 @@ Each request records the key, user, tags, metadata, model and provider, status, 
 | `POST /v1/moderations`, `/v1/rerank`, `/v1/audio/speech` | OpenAI-compatible |
 | `GET /v1/realtime?model=…` | WebSocket relay to OpenAI-compatible realtime APIs; browsers can authenticate with the `openai-insecure-api-key.<key>` subprotocol |
 | `ANY /native/<provider>/<path>` | Any endpoint of a configured provider, in its own format; the gateway adds the provider's credentials |
-| `GET /v1/models` | Routes this key may use, with prices |
+| `GET /v1/models` | Routes and models this key may use, fetched live from the providers, with prices and context length; `?provider=` for one provider |
 | `GET /v1/report`, `GET /v1/generation?id=`, `POST /v1/feedback` | The calling key's own usage report, request lookup and feedback |
 
 All of them get authentication, permissions, limits, guardrails, logging and usage tracking. Native passthrough is not cached, and only `deny` rules (and same-provider rewrites) apply to it, because its bodies are in each provider's own format.
@@ -376,7 +420,7 @@ Also `x-session-id` (session affinity), `ai-reporting-user`, `ai-reporting-tags`
 
 The admin port serves the dashboard at `/` and a JSON API under `/api`, both protected by the admin token (`admin.token_sha256`).
 
-Dashboard pages: **Overview** (traffic, failures, tokens, spend, latency and time to first token, with breakdowns by model, user, tag, API, key and provider), **Requests** (search and filters, full detail with every provider attempt, prompts and responses, feedback, delete), **Usage reports** (by day, model, provider, key, user, tag, credential and ZDR; CSV download), **API keys**, **Routing rules**, **Limits**, **Providers & routes** (health, live latency and throughput, model prices, stored provider keys, reload) and **Audit log**.
+Dashboard pages: **Overview** (traffic, failures, tokens, spend, latency and time to first token, with breakdowns by model, user, tag, API, key and provider), **Requests** (search and filters, full detail with every provider attempt, prompts and responses, feedback, delete), **Models** (every model your providers offer, searchable, with context length and prices), **Usage reports** (by day, model, provider, key, user, tag, credential and ZDR; CSV download), **API keys**, **Routing rules**, **Limits**, **Providers & routes** (add providers and keys, add and edit routes, health, live latency and throughput, model prices, reload) and **Audit log**.
 
 | Admin API | Purpose |
 |---|---|
@@ -386,7 +430,10 @@ Dashboard pages: **Overview** (traffic, failures, tokens, spend, latency and tim
 | `GET /api/report?start_date=&end_date=&group_by=` | Usage report (same fields as Vercel's reporting API) |
 | `GET/POST /api/keys`, `DELETE /api/keys/{name}` | Client keys |
 | `GET/POST /api/rules`, `PATCH/DELETE /api/rules/{id}` | Routing rules |
-| `GET /api/provider-keys`, `PUT/DELETE /api/provider-keys/{provider}` | Stored provider keys |
+| `GET /api/providers`, `PUT/DELETE /api/providers/{name}` | Every provider with its source and key status; add or remove dashboard providers (`kind`, `base_url`, `api_key`, `region`, `project`, …) |
+| `GET /api/provider-keys`, `PUT/DELETE /api/provider-keys/{provider}` | Stored provider keys, for any provider including built-in ones |
+| `GET /api/routes`, `PUT/DELETE /api/routes/{name}` | Every route with its source; add, replace or remove dashboard routes |
+| `GET /api/models`, `POST /api/models/refresh` | The live model catalog with each provider's list status; ask every provider again now |
 | `GET /api/limits`, `GET /api/audit`, `GET /api/config`, `POST /api/reload` | Limit usage, audit log, configuration and health, reload |
 | `GET /api/pricing`, `POST /api/pricing/refresh` | Price list status and the price of every route target; download it again now |
 
@@ -416,7 +463,7 @@ Generate a new key, set its hash as `key_sha256`, and move the old hash into `pr
 
 ### Metrics
 
-Served on `admin_listen` at `/metrics`: `gateway_requests_total`, `gateway_request_duration_seconds`, `gateway_time_to_first_token_seconds`, `gateway_tokens_total`, `gateway_cost_microdollars_total`, `gateway_upstream_errors_total`, `gateway_upstream_skipped_total`, `gateway_circuit_open`, `gateway_rejected_total{reason}`, `gateway_cache_total`, `gateway_store_errors_total`, `gateway_guardrail_hits_total`, `gateway_guardrail_errors_total`, `gateway_alerts_total`, `gateway_export_batches_total`, `gateway_export_dropped_total`, `gateway_config_reloads_total`, `gateway_pricing_refresh_total`.
+Served on `admin_listen` at `/metrics`: `gateway_requests_total`, `gateway_request_duration_seconds`, `gateway_time_to_first_token_seconds`, `gateway_tokens_total`, `gateway_cost_microdollars_total`, `gateway_upstream_errors_total`, `gateway_upstream_skipped_total`, `gateway_circuit_open`, `gateway_rejected_total{reason}`, `gateway_cache_total`, `gateway_store_errors_total`, `gateway_guardrail_hits_total`, `gateway_guardrail_errors_total`, `gateway_alerts_total`, `gateway_export_batches_total`, `gateway_export_dropped_total`, `gateway_config_reloads_total`, `gateway_pricing_refresh_total`, `gateway_catalog_fetch_total`.
 
 ## Development
 
@@ -428,6 +475,7 @@ Served on `admin_listen` at `/metrics`: `gateway_requests_total`, `gateway_reque
 | `src/config.rs` | Every config field, its default and validation |
 | `src/proxy.rs` | The request pipeline: auth, options, target planning, limits, guardrails, cache, retries and fallback |
 | `src/options.rs`, `src/rules.rs`, `src/limits.rs`, `src/guardrails.rs` | Per-request options, routing rules, limits, guardrails |
+| `src/builtin.rs`, `src/catalog.rs` | Built-in providers, the live model catalog |
 | `src/providers/` | Provider adapters: `mod.rs` (building and sending requests), `openai.rs`, `anthropic.rs`, `bedrock.rs` |
 | `src/aws.rs`, `src/gcp.rs` | AWS SigV4 signing, credentials and event streams; Google access tokens |
 | `src/sse.rs`, `src/native.rs`, `src/realtime.rs` | Streaming, native passthrough, WebSocket relay |
@@ -447,7 +495,7 @@ cargo test                                                        # in-memory st
 AIGW_TEST_REDIS_URL=redis://127.0.0.1:6379/0 cargo test           # against real Redis
 ```
 
-`tests/e2e.rs`, `tests/parity.rs` and `tests/cloud.rs` start a real gateway in front of mock OpenAI, Anthropic, Bedrock (checking every SigV4 signature and decoding AWS event streams), Vertex (with a Google token endpoint), moderation, image, speech, rerank and realtime WebSocket servers, plus webhook, log-export and OTLP collectors and a price list.
+`tests/e2e.rs`, `tests/parity.rs`, `tests/cloud.rs` and `tests/dynamic.rs` start a real gateway in front of mock OpenAI, Anthropic, Bedrock (checking every SigV4 signature and decoding AWS event streams), Vertex (with a Google token endpoint), moderation, image, speech, rerank and realtime WebSocket servers, plus webhook, log-export and OTLP collectors and a price list.
 
 CI (`.github/workflows/ci.yml`) runs formatting, clippy, the tests with the in-memory store and against Redis, a release build and a Docker build on every push. `.github/workflows/live.yml` also runs the gateway against the real OpenRouter API when the `OPENROUTER_API_KEY` repository secret is set.
 
