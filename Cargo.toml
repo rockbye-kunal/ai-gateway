@@ -3,7 +3,9 @@ name = "ai-gateway"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.89"
-description = "One OpenAI-compatible API in front of OpenAI, Anthropic, Azure OpenAI, Gemini, Groq and other providers"
+description = "Self-hosted AI gateway: one OpenAI-compatible API in front of OpenAI, Anthropic, Azure OpenAI, AWS Bedrock, Google Vertex AI and other providers"
+repository = "https://github.com/rockbye-kunal/ai-gateway"
+readme = "README.md"
 publish = false
 
 [lib]
