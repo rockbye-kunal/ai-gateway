@@ -16,6 +16,13 @@ The first public version. Everything below is new.
 - AWS Bedrock through the Converse API, with SigV4 signing, the full AWS credential chain, Bedrock API keys and AWS event-stream decoding.
 - Google Vertex AI: Gemini and partner models through the OpenAI-compatible endpoint, Claude in Anthropic's format, with service-account, gcloud and metadata-server credentials.
 
+### Dynamic providers and models
+- Twelve built-in providers (OpenAI, Anthropic, Google Gemini, Mistral, DeepSeek, xAI, Groq, Together, Fireworks, Cerebras, Perplexity, OpenRouter), plus Bedrock and Vertex from cloud credentials, that work as `provider/model` once they have a key from the environment, the dashboard or the request. No `providers:` section needed; `auto_providers: false` turns them off.
+- `/v1/models` lists every model of every provider with a key, fetched from the providers' own model APIs, cached for an hour, with prices and context length.
+- Providers and routes can be added, edited and removed from the dashboard or the admin API, and reach every replica within seconds. A route target whose provider has no key is skipped.
+- A Models page in the dashboard to browse and search the catalog.
+- `keys:` may be empty when an admin token is set, so keys can live only in the dashboard.
+
 ### Routing and reliability
 - Named routes with fallback, weighted (with session affinity), latency and cost strategies, and conditional branches on key, user, tags or metadata.
 - Per-request fallback models and provider `order`, `only` and `sort`; model rewrite and deny rules editable live.

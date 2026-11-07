@@ -334,7 +334,8 @@ keys:
     allowed_models: ["smart"]
 "#,
         // Tests never download the public price list.
-        pricing = if extra.contains("pricing:") { "" } else { "pricing:\n  enabled: false" },
+        pricing =
+            if extra.contains("pricing:") { "" } else { "pricing:\n  enabled: false\nauto_providers: false" },
         admin = hash_key(ADMIN),
         full = hash_key(KEY_FULL),
         other = hash_key(KEY_OTHER),
