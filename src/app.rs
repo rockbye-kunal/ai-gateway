@@ -86,6 +86,21 @@ pub type DynamicErrors = BTreeMap<String, String>;
 /// an entry that doesn't fit (say, a route whose provider was removed from the
 /// config file) is skipped and reported instead of blocking the others.
 pub fn merge_dynamic(base: &Config, raw: &DynamicRaw) -> (Config, DynamicErrors) {
+    // Usually everything fits: one validation instead of one per entry.
+    let all_providers: Option<BTreeMap<String, ProviderConfig>> =
+        raw.providers.iter().map(|(n, v)| serde_json::from_str(v).ok().map(|p| (n.clone(), p))).collect();
+    let all_routes: Option<BTreeMap<String, RouteConfig>> = raw
+        .routes
+        .iter()
+        .map(|(n, v)| {
+            serde_json::from_str::<RouteConfig>(v).ok().filter(|r| r.name == *n).map(|r| (n.clone(), r))
+        })
+        .collect();
+    if let (Some(p), Some(r)) = (&all_providers, &all_routes) {
+        if let Ok(cfg) = base.with_dynamic(p, r) {
+            return (cfg, DynamicErrors::new());
+        }
+    }
     let mut errors = DynamicErrors::new();
     let mut providers: BTreeMap<String, ProviderConfig> = BTreeMap::new();
     for (name, v) in &raw.providers {

@@ -104,11 +104,13 @@ impl Catalog {
         let mut names: Vec<&String> = rt.providers.keys().collect();
         names.sort();
         let mut handles = Vec::new();
+        let mut live = std::collections::HashSet::new();
         for name in names {
             let p = rt.providers[name].clone();
             if !provider_ready(app, &p, None) {
                 continue;
             }
+            live.insert(cache_key(&p, &listing_key(app, &p)));
             // Spawned, so a client hanging up doesn't cancel a fetch others
             // are waiting for.
             handles.push(tokio::spawn(Self::one(app.clone(), p, force)));
@@ -119,6 +121,9 @@ impl Catalog {
                 out.push(entry);
             }
         }
+        // Forget lists for keys and endpoints no longer in use.
+        app.catalog.cache.write().retain(|k, _| live.contains(k));
+        app.catalog.locks.lock().retain(|k, l| live.contains(k) || Arc::strong_count(l) > 1);
         out
     }
 

@@ -853,36 +853,66 @@ pub async fn put_provider(
     opt(&mut def, "no_prompt_training", b.no_prompt_training.map(Value::from));
     opt(&mut def, "auto_prompt_cache", b.auto_prompt_cache.map(Value::from));
     opt(&mut def, "allow_insecure_http", b.allow_insecure_http.map(Value::from));
-    // A key already in use for this name (stored, or from the environment)
-    // must not follow the provider to a different endpoint.
+    // A key already kept for this name (stored, or from the environment)
+    // must not follow the provider to a different kind or endpoint. Stored
+    // keys are kept by name, so this holds even when no provider of that
+    // name is loaded right now.
     if key.is_none() {
-        if let Some(current) = app.rt().providers.get(&name) {
-            let has_key = !current.cfg.api_key.expose().is_empty()
-                || app.stored_provider_keys.read().contains_key(&name);
+        let current = app.rt().providers.get(&name).cloned();
+        let stored = app.stored_provider_keys.read().contains_key(&name);
+        let env_key = current.as_ref().is_some_and(|c| !c.cfg.api_key.expose().is_empty());
+        if stored || env_key {
             let new_url = def.get("base_url").and_then(Value::as_str).unwrap_or("");
-            let moved = current.cfg.kind != b.kind
-                || current.cfg.base_url.trim_end_matches('/') != new_url.trim_end_matches('/');
-            if has_key && moved && !cloud {
+            let new_region = def.get("region").and_then(Value::as_str);
+            let same = current.as_ref().is_some_and(|c| {
+                c.cfg.kind == b.kind
+                    && if cloud {
+                        c.cfg.region.as_deref() == new_region
+                    } else {
+                        c.cfg.base_url.trim_end_matches('/') == new_url.trim_end_matches('/')
+                    }
+            });
+            if !same {
                 return Err(ApiError::bad_request(format!(
-                    "'{name}' has an API key for its current endpoint; send api_key for the new endpoint too"
+                    "'{name}' has an API key for a different endpoint; send api_key for this one too"
                 )));
             }
         }
     }
     let def = Value::Object(def).to_string();
 
-    let mut raw = stored_dynamic(&app).await?;
+    let raw_before = stored_dynamic(&app).await?;
+    let mut raw = raw_before.clone();
     raw.providers.insert(name.clone(), def.clone());
     if let Some(why) = app.check_dynamic(&raw).get(&format!("provider:{name}")) {
         return Err(ApiError::bad_request(why.clone()));
     }
 
+    // Remember what was stored so a failed apply (say, a concurrent change
+    // on another replica) can be undone.
+    let old_def = raw_before.providers.get(&name).cloned();
+    let old_key = app.store.hgetall(PROVIDER_KEYS).await.map_err(store_unavailable)?.remove(&name);
     if let (Some(k), Some(cipher)) = (key, &app.cipher) {
         let enc = cipher.encrypt(k).map_err(|_| ApiError::internal_config("encryption failed"))?;
         app.store.hset(PROVIDER_KEYS, &name, &enc).await.map_err(store_unavailable)?;
     }
     app.store.hset(STORED_PROVIDERS, &name, &def).await.map_err(store_unavailable)?;
-    apply_and_check(&app, &format!("provider:{name}")).await?;
+    if let Err(e) = apply_and_check(&app, &format!("provider:{name}")).await {
+        let undo_def = match &old_def {
+            Some(d) => app.store.hset(STORED_PROVIDERS, &name, d).await,
+            None => app.store.hdel(STORED_PROVIDERS, &name).await.map(|_| ()),
+        };
+        let undo_key = match (&old_key, key.is_some()) {
+            (Some(k), true) => app.store.hset(PROVIDER_KEYS, &name, k).await,
+            (None, true) => app.store.hdel(PROVIDER_KEYS, &name).await.map(|_| ()),
+            _ => Ok(()),
+        };
+        if undo_def.is_err() || undo_key.is_err() {
+            tracing::warn!(provider = %name, "could not undo a provider change that failed to apply");
+        }
+        let _ = refresh_dynamic(&app).await;
+        return Err(e);
+    }
     audit(&app, "provider.set", &name, json!({"kind": b.kind, "key": key.map(hint)})).await;
     let ready = app.rt().providers.get(&name).is_some_and(|p| crate::proxy::provider_ready(&app, p, None));
     Ok(Json(json!({"name": name, "ready": ready})))
@@ -1000,12 +1030,23 @@ pub async fn put_route(
     let def =
         serde_json::to_string(&route).map_err(|_| ApiError::internal_config("route encoding failed"))?;
     let mut raw = stored_dynamic(&app).await?;
+    let old_def = raw.routes.get(&name).cloned();
     raw.routes.insert(name.clone(), def.clone());
     if let Some(why) = app.check_dynamic(&raw).get(&format!("route:{name}")) {
         return Err(ApiError::bad_request(why.clone()));
     }
     app.store.hset(STORED_ROUTES, &name, &def).await.map_err(store_unavailable)?;
-    apply_and_check(&app, &format!("route:{name}")).await?;
+    if let Err(e) = apply_and_check(&app, &format!("route:{name}")).await {
+        let undo = match &old_def {
+            Some(d) => app.store.hset(STORED_ROUTES, &name, d).await,
+            None => app.store.hdel(STORED_ROUTES, &name).await.map(|_| ()),
+        };
+        if undo.is_err() {
+            tracing::warn!(route = %name, "could not undo a route change that failed to apply");
+        }
+        let _ = refresh_dynamic(&app).await;
+        return Err(e);
+    }
     audit(&app, "route.set", &name, json!({"targets": route.targets.len()})).await;
     Ok(Json(serde_json::to_value(&route).unwrap_or_default()))
 }
