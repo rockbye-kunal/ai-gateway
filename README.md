@@ -1,15 +1,16 @@
 # ai-gateway
 
-A self-hosted AI gateway in Rust: one place in front of OpenAI, Anthropic, Azure OpenAI, Gemini, Groq, OpenRouter and any OpenAI-compatible provider, with the controls Cloudflare AI Gateway and Vercel AI Gateway offer. Clients keep using the OpenAI or Anthropic SDKs and point their base URL at the gateway. It runs as several replicas behind a load balancer with Redis holding shared state, and ships with a web dashboard.
+A self-hosted AI gateway in Rust: one place in front of OpenAI, Anthropic, Azure OpenAI, AWS Bedrock, Google Vertex AI, Gemini, Groq, OpenRouter and any OpenAI-compatible provider, with the controls Cloudflare AI Gateway and Vercel AI Gateway offer. Clients keep using the OpenAI or Anthropic SDKs and point their base URL at the gateway. It runs as several replicas behind a load balancer with Redis holding shared state, and ships with a web dashboard.
 
 ## What it does
 
 | Area | Behaviour |
 |---|---|
 | **APIs** | OpenAI Chat Completions (streaming), Responses, Embeddings, Images, Moderations, Rerank, Audio speech, Realtime (WebSockets); Anthropic Messages (native); `/native/<provider>/<any path>` passthrough for every other provider endpoint; `/v1/models` |
-| **Providers** | OpenAI-compatible (OpenAI, Gemini, Groq, Together, Mistral, vLLM, Ollama, OpenRouter…), Azure OpenAI, Anthropic (full translation to the OpenAI format, including tools, images and streaming) |
+| **Providers** | OpenAI-compatible (OpenAI, Gemini, Groq, Together, Mistral, vLLM, Ollama, OpenRouter…), Azure OpenAI, Anthropic, AWS Bedrock (Converse API, SigV4 signing, every AWS credential source) and Google Vertex AI (Gemini and partner models, Claude in the Anthropic format, service account or metadata-server auth); Anthropic and Bedrock are translated to the OpenAI format, including tools, images and streaming |
 | **Routing** | Named routes with fallbacks, weighted A/B splits with session affinity, fastest-first and cheapest-first strategies, conditional branches on key, user, tags or metadata, request-level fallback models, provider `order`/`only`/`sort`, model rewrite and deny rules editable live |
 | **Reliability** | Retries with configurable backoff, per-provider and per-request timeouts, stream idle timeout, circuit breakers with alerts, fallback on 5xx / timeouts / 429 / bad credentials |
+| **Pricing** | Costs worked out automatically from a public price list (LiteLLM's, refreshed daily, or a local file), including cache read and write rates; per-target prices and overrides win |
 | **Limits and spend** | Per-key requests/minute and token budgets; request, token and dollar limits per minute/hour/day/week/month, split by key, user, model, provider or any metadata field; threshold alerts by signed webhook |
 | **Caching** | Exact-match cache for normal and streaming responses, per key, with per-request TTL, skip and custom cache key; automatic Anthropic prompt caching |
 | **Security** | Hashed client keys, keys and routing rules managed live, BYOK (request-scoped or stored encrypted), zero data retention and no-training provider filters, guardrails and DLP (regex detectors and moderation models), audit log |
@@ -51,6 +52,52 @@ Response headers: `x-request-id` (also `x-gateway-generation-id`), `x-gateway-pr
 
 Open the dashboard at `http://<admin host>:9090/` and sign in with the admin token.
 
+## AWS Bedrock and Google Vertex AI
+
+```yaml
+providers:
+  bedrock:
+    kind: bedrock
+    region: us-east-1            # or AWS_REGION
+    # Optional. Without keys the standard AWS chain is used: AWS_ACCESS_KEY_ID/…,
+    # EKS web identity (IRSA), ECS task role, then the EC2 instance role (IMDSv2).
+    # aws_access_key_id: ${AWS_ACCESS_KEY_ID}
+    # aws_secret_access_key: ${AWS_SECRET_ACCESS_KEY}
+    # Or a Bedrock API key, sent as a bearer token:
+    # api_key: ${AWS_BEARER_TOKEN_BEDROCK}
+  vertex:
+    kind: vertex
+    project: my-gcp-project
+    region: us-central1          # or global
+    # Optional. Without these, GOOGLE_APPLICATION_CREDENTIALS and then the
+    # metadata server (GKE, Cloud Run, GCE) are used.
+    # credentials_file: /secrets/vertex-sa.json
+```
+
+- **Bedrock** chat goes through the Converse API (`converse` and `converse-stream`), so any Bedrock chat model works: `bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0`, `bedrock/amazon.nova-pro-v1:0`, inference profile ARNs. Tools, images (base64), system prompts, stop sequences and prompt caching (`auto_prompt_cache`) are translated; `additionalModelRequestFields` and `guardrailConfig` pass through. Other Bedrock APIs (InvokeModel, embeddings) go through `/native/bedrock/...`, signed for you.
+- **Vertex**: Gemini and other publisher models use Vertex's OpenAI-compatible endpoint (`vertex/gemini-2.5-flash` is sent as `google/gemini-2.5-flash`; give other publishers in full, like `vertex/meta/llama-...`). Models starting with `claude-` use Anthropic's format on Vertex (`rawPredict`/`streamRawPredict`), for both `/v1/chat/completions` and `/v1/messages`. Everything else is reachable at `/native/vertex/projects/...`.
+- Credentials are cached until shortly before they expire.
+
+## Model prices
+
+Every request gets a cost, used by spend limits, reports and the `cost` routing strategy. The price is the first of:
+
+1. `price_input_per_mtok` / `price_output_per_mtok` on the route target;
+2. `pricing.overrides`, keyed `provider/model` or `model`;
+3. the price list, matched by provider type, host and model (dated, regional and versioned names fall back to their base model).
+
+```yaml
+pricing:
+  enabled: true                 # default
+  refresh_hours: 24
+  # url: <LiteLLM-format JSON>  # default: LiteLLM's public list
+  # file: prices.json           # for installs without internet access
+  overrides:
+    openai/my-fine-tune: {input_per_mtok: 3.0, output_per_mtok: 12.0}
+```
+
+Cache reads and writes are priced at their own rates when the list has them. Replicas share the list through Redis, so only one needs to download it. Providers that report their own cost (OpenRouter) keep that cost. The Providers & routes page shows the price used for every route target; `GET /api/pricing` and `POST /api/pricing/refresh` do the same over the API. For an OpenAI-compatible provider the list doesn't recognise by its host, set `pricing_prefix` (for example `openrouter/`).
+
 ## Choosing a model
 
 `model` can be:
@@ -67,7 +114,7 @@ Keys list what they may use in `allowed_models`: route names, `provider/model`, 
 |---|---|
 | `POST /v1/chat/completions` | Every provider (Anthropic is translated) |
 | `POST /v1/responses` | OpenAI-compatible providers, streams passed through event by event |
-| `POST /v1/messages` | Anthropic providers, native format, `anthropic-version`/`anthropic-beta` forwarded |
+| `POST /v1/messages` | Anthropic providers and Claude on Vertex, native format, `anthropic-version`/`anthropic-beta` forwarded |
 | `POST /v1/embeddings`, `/v1/images/generations` | OpenAI-compatible and Azure |
 | `POST /v1/moderations`, `/v1/rerank`, `/v1/audio/speech` | OpenAI-compatible |
 | `GET /v1/realtime?model=…` | WebSocket relay to OpenAI-compatible realtime APIs; browsers can authenticate with the `openai-insecure-api-key.<key>` subprotocol |
@@ -237,6 +284,7 @@ The admin port serves the dashboard at `/` and a JSON API under `/api`, both pro
 | `GET/POST /api/rules`, `PATCH/DELETE /api/rules/{id}` | Routing rules |
 | `GET /api/provider-keys`, `PUT/DELETE /api/provider-keys/{provider}` | Stored provider keys |
 | `GET /api/limits`, `GET /api/audit`, `GET /api/config`, `POST /api/reload` | Limit usage, audit log, configuration and health, reload |
+| `GET /api/pricing`, `POST /api/pricing/refresh` | Price list status and the price of every route target; download it again now |
 
 ## Logs, export and tracing
 
@@ -305,7 +353,7 @@ cargo test                                                        # in-memory st
 AIGW_TEST_REDIS_URL=redis://127.0.0.1:6379/0 cargo test           # against real Redis
 ```
 
-`tests/e2e.rs` and `tests/parity.rs` run a real gateway in front of mock OpenAI, Anthropic, moderation, image, speech, rerank and realtime WebSocket servers, plus webhook, log-export and OTLP collectors, covering every feature above.
+`tests/e2e.rs`, `tests/parity.rs` and `tests/cloud.rs` run a real gateway in front of mock OpenAI, Anthropic, Bedrock (checking every SigV4 signature and decoding AWS event streams), Vertex (with a Google token endpoint), moderation, image, speech, rerank and realtime WebSocket servers, plus webhook, log-export and OTLP collectors and a price list, covering every feature above.
 
 ## How it compares
 

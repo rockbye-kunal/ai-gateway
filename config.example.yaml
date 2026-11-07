@@ -135,6 +135,23 @@ providers:
   #   base_url: https://YOUR-RESOURCE.openai.azure.com/openai/deployments
   #   api_key: ${AZURE_OPENAI_API_KEY}
   #   api_version: "2024-10-21"
+  # bedrock:
+  #   kind: bedrock               # model: us.anthropic.claude-sonnet-4-5-20250929-v1:0, amazon.nova-pro-v1:0, ...
+  #   region: us-east-1           # AWS credentials come from the usual AWS sources (env, IRSA, ECS, EC2 role)
+  # vertex:
+  #   kind: vertex                # model: gemini-2.5-flash, claude-sonnet-4-5@20250929, ...
+  #   project: my-gcp-project
+  #   region: us-central1
+  #   credentials_file: /secrets/vertex-sa.json   # or GOOGLE_APPLICATION_CREDENTIALS / metadata server
+
+# Costs come from a public price list (refreshed daily) unless a route target
+# sets its own prices. Turn it off or point it at a local file if the gateway
+# has no internet access.
+# pricing:
+#   enabled: true
+#   file: prices.json
+#   overrides:
+#     openai/my-fine-tune: {input_per_mtok: 3.0, output_per_mtok: 12.0}
 
 # Routes are stable names clients can use instead of raw model names. Targets
 # are tried in order: retries happen on each target, then the next target is

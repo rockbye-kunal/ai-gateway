@@ -606,6 +606,10 @@ pub async fn list_provider_keys(
 
 fn hint(k: &str) -> String {
     let n = k.chars().count();
+    // No key: Bedrock and Vertex use their cloud credentials.
+    if n == 0 {
+        return String::new();
+    }
     if n <= 8 {
         return "••••".into();
     }
@@ -691,6 +695,51 @@ pub async fn reload(State(app): State<Arc<AppState>>, headers: HeaderMap) -> Res
         }
         Err(e) => Err(ApiError::bad_request(format!("config not reloaded: {e:#}"))),
     }
+}
+
+/// The price list's state and the resolved price of every route target.
+pub async fn pricing_status(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&app, &headers)?;
+    let rt = app.rt();
+    let (models, updated_at, source) = app.pricing.status();
+    let mut targets: Vec<Value> = Vec::new();
+    let mut names: Vec<&String> = rt.routes.keys().collect();
+    names.sort();
+    for name in names {
+        let r = &rt.routes[name];
+        let all = r.targets.iter().chain(r.branches.iter().flat_map(|b| b.targets.iter()));
+        for t in all {
+            let Some(p) = rt.providers.get(&t.provider) else { continue };
+            let found = app.pricing.lookup(&rt.cfg.pricing, &t.provider, &p.cfg, t);
+            targets.push(json!({
+                "route": name,
+                "target": format!("{}/{}", t.provider, t.model),
+                "price": found.map(|(p, _)| p),
+                "source": found.map(|(_, s)| s),
+            }));
+        }
+    }
+    Ok(Json(json!({
+        "enabled": rt.cfg.pricing.enabled,
+        "source": source,
+        "models": models,
+        "updated_at": updated_at,
+        "targets": targets,
+    })))
+}
+
+pub async fn refresh_pricing(
+    State(app): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&app, &headers)?;
+    app.pricing.refresh(&app, true).await;
+    let (models, updated_at, source) = app.pricing.status();
+    audit(&app, "pricing.refresh", "pricing", json!({"models": models})).await;
+    Ok(Json(json!({"models": models, "updated_at": updated_at, "source": source})))
 }
 
 pub async fn get_config(

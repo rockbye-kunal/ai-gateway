@@ -15,7 +15,7 @@ use serde::Deserialize;
 use serde_yaml::Value;
 
 /// A string that never appears in Debug output or logs.
-#[derive(Clone, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(transparent)]
 pub struct Secret(String);
 
@@ -67,6 +67,39 @@ pub struct Config {
     pub routing_rules: Vec<RoutingRuleConfig>,
     #[serde(default)]
     pub alerts: AlertsConfig,
+    #[serde(default)]
+    pub pricing: PricingConfig,
+}
+
+pub const LITELLM_PRICES_URL: &str =
+    "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
+
+/// Automatic model prices (see `pricing.rs`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PricingConfig {
+    /// Load a public price list so requests get a cost without `price_*` on
+    /// every target.
+    pub enabled: bool,
+    /// A price list in LiteLLM's JSON format.
+    pub url: String,
+    /// Read the list from this file instead of `url` (air-gapped installs).
+    pub file: Option<String>,
+    pub refresh_hours: u64,
+    /// Prices that win over the list, keyed `provider/model` or `model`.
+    pub overrides: HashMap<String, crate::pricing::Price>,
+}
+
+impl Default for PricingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            url: LITELLM_PRICES_URL.to_string(),
+            file: None,
+            refresh_hours: 24,
+            overrides: HashMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, serde::Serialize)]
@@ -437,14 +470,50 @@ pub enum ProviderKind {
     Azure,
     /// Anthropic Messages API. Requests and responses are translated.
     Anthropic,
+    /// AWS Bedrock (Converse API), signed with SigV4.
+    Bedrock,
+    /// Google Vertex AI: Gemini and partner models through the
+    /// OpenAI-compatible endpoint, Claude through the Anthropic publisher.
+    Vertex,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     pub kind: ProviderKind,
+    /// Derived from `region` (and `project`) for Bedrock and Vertex.
+    #[serde(default)]
     pub base_url: String,
+    /// Not needed for Bedrock (AWS credentials) or Vertex (Google
+    /// credentials); when set there it is sent as a bearer token (a Bedrock
+    /// API key, or a Google access token).
+    #[serde(default)]
     pub api_key: Secret,
+    /// Bedrock: AWS region. Vertex: location (`us-central1`, `global`, ...).
+    #[serde(default)]
+    pub region: Option<String>,
+    /// Vertex: Google Cloud project id.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Bedrock: static AWS keys. Without them the standard AWS credential
+    /// chain is used (environment, web identity, ECS, EC2 instance role).
+    #[serde(default)]
+    pub aws_access_key_id: Option<Secret>,
+    #[serde(default)]
+    pub aws_secret_access_key: Option<Secret>,
+    #[serde(default)]
+    pub aws_session_token: Option<Secret>,
+    /// Vertex: service account key JSON, inline or as a file path. Without
+    /// either, `GOOGLE_APPLICATION_CREDENTIALS` and then the metadata server
+    /// are used.
+    #[serde(default)]
+    pub credentials_json: Option<Secret>,
+    #[serde(default)]
+    pub credentials_file: Option<String>,
+    /// Prefix for looking this provider's models up in the price list, e.g.
+    /// `openrouter/` (see `pricing`).
+    #[serde(default)]
+    pub pricing_prefix: Option<String>,
     /// Required for Azure, e.g. `2024-10-21`.
     #[serde(default)]
     pub api_version: Option<String>,
@@ -628,9 +697,35 @@ impl Config {
     pub fn from_yaml_str(text: &str) -> Result<Self> {
         let mut value: Value = serde_yaml::from_str(text).context("parsing YAML")?;
         substitute_env(&mut value)?;
-        let cfg: Config = serde_yaml::from_value(value).context("invalid configuration")?;
+        let mut cfg: Config = serde_yaml::from_value(value).context("invalid configuration")?;
+        cfg.fill_defaults();
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Derives Bedrock and Vertex endpoints from their region and project.
+    fn fill_defaults(&mut self) {
+        for p in self.providers.values_mut() {
+            if p.kind == ProviderKind::Bedrock && p.region.is_none() {
+                p.region = std::env::var("AWS_REGION")
+                    .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
+                    .ok()
+                    .filter(|r| !r.is_empty());
+            }
+            if p.kind == ProviderKind::Vertex && p.region.is_none() {
+                p.region = Some("us-central1".into());
+            }
+            if !p.base_url.trim().is_empty() {
+                continue;
+            }
+            let region = p.region.clone().unwrap_or_default();
+            p.base_url = match p.kind {
+                ProviderKind::Bedrock => format!("https://bedrock-runtime.{region}.amazonaws.com"),
+                ProviderKind::Vertex if region == "global" => "https://aiplatform.googleapis.com/v1".into(),
+                ProviderKind::Vertex => format!("https://{region}-aiplatform.googleapis.com/v1"),
+                _ => continue,
+            };
+        }
     }
 
     fn validate(&self) -> Result<()> {
@@ -664,8 +759,39 @@ impl Config {
             if !valid_ident(name) {
                 bail!("provider name '{name}' may only contain letters, digits, '-', '_' and '.'");
             }
-            if p.api_key.expose().trim().is_empty() {
+            let cloud = matches!(p.kind, ProviderKind::Bedrock | ProviderKind::Vertex);
+            if !cloud && p.api_key.expose().trim().is_empty() {
                 bail!("provider {name}: api_key is empty");
+            }
+            if p.base_url.trim().is_empty() {
+                bail!("provider {name}: base_url is required");
+            }
+            if let Some(r) = &p.region {
+                if r.is_empty() || !r.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                    bail!("provider {name}: region '{r}' is not valid");
+                }
+            }
+            if p.kind == ProviderKind::Bedrock {
+                if p.region.is_none() {
+                    bail!("provider {name}: bedrock providers need a region (or AWS_REGION)");
+                }
+                if p.aws_access_key_id.is_some() != p.aws_secret_access_key.is_some() {
+                    bail!(
+                        "provider {name}: set both aws_access_key_id and aws_secret_access_key, or neither"
+                    );
+                }
+            }
+            if p.kind == ProviderKind::Vertex {
+                match &p.project {
+                    Some(v)
+                        if !v.is_empty()
+                            && v.chars()
+                                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == ':') => {}
+                    _ => bail!("provider {name}: vertex providers need a valid project"),
+                }
+                if p.credentials_json.is_some() && p.credentials_file.is_some() {
+                    bail!("provider {name}: set credentials_json or credentials_file, not both");
+                }
             }
             let url = p.base_url.trim();
             if url.contains('@') || url.contains(char::is_whitespace) || url.contains(['?', '#']) {

@@ -42,6 +42,7 @@ pub fn effective_usage(t: &dyn StreamTranslator, prompt_estimate: u64) -> Usage 
         prompt_tokens: if reported.prompt_tokens > 0 { reported.prompt_tokens } else { prompt_estimate },
         completion_tokens: reported.completion_tokens.max(t.streamed_chars().div_ceil(CHARS_PER_TOKEN)),
         cached_tokens: reported.cached_tokens,
+        cache_write_tokens: reported.cache_write_tokens,
         reasoning_tokens: reported.reasoning_tokens,
         // An estimate has no provider-reported cost; configured prices apply.
         cost_microusd: None,
@@ -186,8 +187,15 @@ pub fn event_stream(
     cache: Option<CacheSink>,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
     async_stream::stream! {
+        // Bedrock streams binary AWS event-stream frames instead of SSE.
+        let aws_framing = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.starts_with("application/vnd.amazon.eventstream"));
         let mut upstream = Box::pin(resp.bytes_stream());
         let mut parser = SseParser::default();
+        let mut aws_parser = crate::aws::EventStreamParser::default();
         let mut out: Vec<String> = Vec::new();
         let mut cached: Option<Vec<u8>> = cache.as_ref().map(|_| Vec::new());
         let mut first = true;
@@ -226,7 +234,7 @@ pub fn event_stream(
                     break;
                 }
                 Ok(Some(Ok(chunk))) => {
-                    let parsed = parser.push(&chunk);
+                    let parsed = if aws_framing { aws_parser.push(&chunk) } else { parser.push(&chunk) };
                     let events = match parsed {
                         Ok(events) => events,
                         Err(msg) => {

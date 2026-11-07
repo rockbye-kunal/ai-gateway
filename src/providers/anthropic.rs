@@ -9,6 +9,8 @@ use serde_json::{json, Map, Value};
 use crate::{error::ApiError, sse::StreamTranslator, usage::Usage};
 
 pub const API_VERSION: &str = "2023-06-01";
+/// `anthropic_version` for Claude on Vertex AI.
+pub const VERTEX_VERSION: &str = "vertex-2023-10-16";
 
 fn bad(msg: impl Into<String>) -> ApiError {
     ApiError::bad_request(msg)

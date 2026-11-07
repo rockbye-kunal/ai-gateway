@@ -235,7 +235,7 @@ async fn handle(
                 })
             })
         };
-        let resp = match tokio::time::timeout(provider.timeout(), rb.send()).await {
+        let resp = match tokio::time::timeout(provider.timeout(), provider.send(rb, &key)).await {
             Ok(Ok(r)) => r,
             Ok(Err(_)) | Err(_) => {
                 provider_failed(app, &provider);
