@@ -287,7 +287,7 @@ Every request gets a cost, used by spend limits, reports, the dashboard and the 
 
 1. a `custom-cost` option on the request;
 2. the cost the provider reported (OpenRouter);
-3. a price: `price_input_per_mtok` / `price_output_per_mtok` on the route target, then `pricing.overrides` (keyed `provider/model` or `model`), then the public price list, matched by provider type, host and model (dated, regional and versioned names fall back to their base model).
+3. a price: `price_input_per_mtok` / `price_output_per_mtok` on the route target, then `pricing.overrides` (keyed `provider/model` or `model`), then the public price list, matched by provider type, host and model. Dated, regional and versioned names fall back to their base model, and `claude-haiku-4.5` also matches the list's `claude-haiku-4-5`.
 
 ```yaml
 pricing:
@@ -299,7 +299,7 @@ pricing:
     openai/my-fine-tune: {input_per_mtok: 3.0, output_per_mtok: 12.0}
 ```
 
-Prompt-cache reads and writes are priced at their own rates when the list has them. Replicas share the list through Redis, so only one needs to download it. The Providers & routes page shows the price used for every route target, and so do `GET /api/pricing` and `POST /api/pricing/refresh`. For an OpenAI-compatible provider the list doesn't recognise by its host, set `pricing_prefix` (for example `openrouter/`).
+Prompt-cache reads and writes are priced at their own rates when the list has them. Replicas share the list through Redis, so only one needs to download it. The Providers & routes page shows the price used for every route target, and so do `GET /api/pricing` and `POST /api/pricing/refresh`. Models reached through a router such as OpenRouter are matched by their plain name (`openai/gpt-4o-mini` is priced as `gpt-4o-mini`), and OpenRouter's own reported cost wins when it sends one. For an OpenAI-compatible provider the list files under its own prefix but the gateway doesn't recognise by host, set `pricing_prefix` (for example `together_ai/` for your own proxy in front of Together AI).
 
 ### Logs, export and tracing
 
