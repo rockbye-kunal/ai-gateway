@@ -265,6 +265,13 @@ fn config_yaml(m: SocketAddr, extra: &str) -> String {
         ),
         Err(_) => String::new(),
     };
+    // Tests never download the public price list, and never pick up
+    // provider keys from the developer's environment.
+    let pricing_block = format!(
+        "{}{}",
+        if extra.contains("pricing:") { "" } else { "pricing:\n  enabled: false\n" },
+        if extra.contains("auto_providers:") { "" } else { "auto_providers: false\n" }
+    );
     format!(
         r#"
 {store}
@@ -333,9 +340,7 @@ keys:
     key_sha256: "{restricted}"
     allowed_models: ["smart"]
 "#,
-        // Tests never download the public price list.
-        pricing =
-            if extra.contains("pricing:") { "" } else { "pricing:\n  enabled: false\nauto_providers: false" },
+        pricing = pricing_block,
         admin = hash_key(ADMIN),
         full = hash_key(KEY_FULL),
         other = hash_key(KEY_OTHER),

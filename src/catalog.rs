@@ -57,13 +57,8 @@ pub struct ProviderModels {
 #[derive(Default)]
 pub struct Catalog {
     cache: RwLock<HashMap<String, ProviderModels>>,
-}
-
-/// Cache key: the list depends on the provider's endpoint and kind.
-fn cache_key(p: &Provider) -> String {
-    let mut h = Sha256::new();
-    h.update(format!("{:?}|{}", p.cfg.kind, p.cfg.base_url).as_bytes());
-    format!("catalog:{}:{}", p.name, &hex::encode(h.finalize())[..16])
+    /// One lock per cache key, so concurrent requests share a single fetch.
+    locks: parking_lot::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// The key used to list models: a stored key, else the configured one (never
@@ -75,102 +70,140 @@ fn listing_key(app: &AppState, p: &Provider) -> String {
     }
 }
 
+/// Cache key: the list depends on the provider's kind, endpoint and key (a
+/// different account can see different models). Only a hash is kept.
+fn cache_key(p: &Provider, api_key: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(format!("{:?}|{}|{api_key}", p.cfg.kind, p.cfg.base_url).as_bytes());
+    format!("catalog:{}:{}", p.name, &hex::encode(h.finalize())[..16])
+}
+
 impl Catalog {
-    /// Model lists of every provider that has a key, fetching the ones that
-    /// are missing or stale (or all of them with `force`).
-    pub async fn lists(&self, app: &AppState, force: bool) -> Vec<ProviderModels> {
+    fn lock_for(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.locks.lock().entry(key.to_string()).or_default().clone()
+    }
+
+    /// A list that is still fresh, from memory or (shared by replicas) the
+    /// store.
+    async fn fresh(&self, app: &AppState, key: &str, now: u64) -> Option<ProviderModels> {
+        if let Some(c) = self.cache.read().get(key).filter(|c| now < c.next_fetch) {
+            return Some(c.clone());
+        }
+        let raw = app.store.kv_get(key).await.ok().flatten()?;
+        let c = serde_json::from_str::<ProviderModels>(&raw).ok().filter(|c| now < c.next_fetch)?;
+        self.cache.write().insert(key.to_string(), c.clone());
+        Some(c)
+    }
+
+    /// Model lists of every provider that has a key. Fresh lists come from
+    /// the cache; a stale one is returned at once and refreshed in the
+    /// background; a missing one is fetched (once, however many requests ask).
+    /// `force` fetches every list again now.
+    pub async fn lists(app: &Arc<AppState>, force: bool) -> Vec<ProviderModels> {
         let rt = app.rt();
-        let now = unix_secs();
-        let mut out = Vec::new();
-        let mut tasks = tokio::task::JoinSet::new();
         let mut names: Vec<&String> = rt.providers.keys().collect();
         names.sort();
+        let mut handles = Vec::new();
         for name in names {
             let p = rt.providers[name].clone();
             if !provider_ready(app, &p, None) {
                 continue;
             }
-            let key = cache_key(&p);
-            let cached = self.cache.read().get(&key).cloned();
-            if let Some(c) = &cached {
-                if !force && now < c.next_fetch {
-                    out.push(c.clone());
-                    continue;
-                }
-            }
-            if !force {
-                if let Ok(Some(raw)) = app.store.kv_get(&key).await {
-                    if let Ok(c) = serde_json::from_str::<ProviderModels>(&raw) {
-                        if now < c.next_fetch {
-                            self.cache.write().insert(key, c.clone());
-                            out.push(c);
-                            continue;
-                        }
-                    }
-                }
-            }
-            let api_key = listing_key(app, &p);
-            let Some(requests) = p.list_models(&api_key) else {
-                out.push(ProviderModels {
-                    provider: p.name.clone(),
-                    error: Some(match p.cfg.kind {
-                        ProviderKind::Vertex => {
-                            "Vertex AI has no model list API; use model names from Google's docs".into()
-                        }
-                        _ => "this provider type has no model list API".into(),
-                    }),
-                    ..Default::default()
-                });
-                continue;
-            };
-            tasks.spawn(async move {
-                let result = match requests {
-                    Ok(reqs) => fetch(&p, reqs, &api_key).await,
-                    Err(e) => Err(e.message),
-                };
-                (p.name.clone(), key, result, cached)
-            });
+            // Spawned, so a client hanging up doesn't cancel a fetch others
+            // are waiting for.
+            handles.push(tokio::spawn(Self::one(app.clone(), p, force)));
         }
-        while let Some(done) = tasks.join_next().await {
-            let Ok((provider, key, result, cached)) = done else { continue };
-            let entry = match result {
-                Ok(mut models) => {
-                    models.sort_by(|a, b| a.id.cmp(&b.id));
-                    models.dedup_by(|a, b| a.id == b.id);
-                    metrics::counter!("gateway_catalog_fetch_total", "provider" => provider.clone(), "result" => "ok")
-                        .increment(1);
-                    ProviderModels {
-                        provider,
-                        fetched_at: now,
-                        models,
-                        error: None,
-                        next_fetch: now + TTL_SECS,
-                    }
-                }
-                Err(e) => {
-                    metrics::counter!("gateway_catalog_fetch_total", "provider" => provider.clone(), "result" => "failed")
-                        .increment(1);
-                    tracing::warn!(%provider, error = %e, "could not fetch the provider's model list");
-                    let old = cached.unwrap_or_default();
-                    ProviderModels {
-                        provider,
-                        fetched_at: old.fetched_at,
-                        models: old.models,
-                        error: Some(e),
-                        next_fetch: now + RETRY_SECS,
-                    }
-                }
-            };
-            if let Ok(raw) = serde_json::to_string(&entry) {
-                if let Err(e) = app.store.kv_set(&key, &raw, TTL_SECS).await {
-                    tracing::debug!(error = %e, "could not share the model list through the store");
-                }
+        let mut out = Vec::new();
+        for h in handles {
+            if let Ok(entry) = h.await {
+                out.push(entry);
             }
-            self.cache.write().insert(key, entry.clone());
-            out.push(entry);
         }
-        out.sort_by(|a, b| a.provider.cmp(&b.provider));
         out
+    }
+
+    async fn one(app: Arc<AppState>, p: Arc<Provider>, force: bool) -> ProviderModels {
+        let api_key = listing_key(&app, &p);
+        if p.list_models(&api_key).is_none() {
+            return ProviderModels {
+                provider: p.name.clone(),
+                error: Some(match p.cfg.kind {
+                    ProviderKind::Vertex => {
+                        "Vertex AI has no model list API; use model names from Google's docs".into()
+                    }
+                    _ => "this provider type has no model list API".into(),
+                }),
+                ..Default::default()
+            };
+        }
+        let key = cache_key(&p, &api_key);
+        let catalog = &app.catalog;
+        if !force {
+            if let Some(c) = catalog.fresh(&app, &key, unix_secs()).await {
+                return c;
+            }
+            let stale = catalog.cache.read().get(&key).cloned();
+            if let Some(stale) = stale {
+                let lock = catalog.lock_for(&key);
+                if let Ok(guard) = lock.clone().try_lock_owned() {
+                    let app = app.clone();
+                    tokio::spawn(async move {
+                        let _guard = guard;
+                        Self::refresh(&app, &p, &key, &api_key).await;
+                    });
+                }
+                return stale;
+            }
+        }
+        let lock = catalog.lock_for(&key);
+        let _guard = lock.lock().await;
+        if !force {
+            // Someone else may have fetched it while we waited.
+            if let Some(c) = catalog.fresh(&app, &key, unix_secs()).await {
+                return c;
+            }
+        }
+        Self::refresh(&app, &p, &key, &api_key).await
+    }
+
+    async fn refresh(app: &AppState, p: &Arc<Provider>, key: &str, api_key: &str) -> ProviderModels {
+        let now = unix_secs();
+        let previous = app.catalog.cache.read().get(key).cloned();
+        let result = match p.list_models(api_key) {
+            Some(Ok(reqs)) => fetch(p, reqs, api_key).await,
+            Some(Err(e)) => Err(e.message),
+            None => Err("this provider type has no model list API".into()),
+        };
+        let provider = p.name.clone();
+        let entry = match result {
+            Ok(mut models) => {
+                models.sort_by(|a, b| a.id.cmp(&b.id));
+                models.dedup_by(|a, b| a.id == b.id);
+                metrics::counter!("gateway_catalog_fetch_total", "provider" => provider.clone(), "result" => "ok")
+                    .increment(1);
+                ProviderModels { provider, fetched_at: now, models, error: None, next_fetch: now + TTL_SECS }
+            }
+            Err(e) => {
+                metrics::counter!("gateway_catalog_fetch_total", "provider" => provider.clone(), "result" => "failed")
+                    .increment(1);
+                tracing::warn!(%provider, error = %e, "could not fetch the provider's model list");
+                let old = previous.unwrap_or_default();
+                ProviderModels {
+                    provider,
+                    fetched_at: old.fetched_at,
+                    models: old.models,
+                    error: Some(e),
+                    next_fetch: now + RETRY_SECS,
+                }
+            }
+        };
+        if let Ok(raw) = serde_json::to_string(&entry) {
+            if let Err(e) = app.store.kv_set(key, &raw, TTL_SECS).await {
+                tracing::debug!(error = %e, "could not share the model list through the store");
+            }
+        }
+        app.catalog.cache.write().insert(key.to_string(), entry.clone());
+        entry
     }
 }
 

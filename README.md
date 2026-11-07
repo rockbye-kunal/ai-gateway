@@ -133,7 +133,9 @@ Everything is in one YAML file; `config.example.yaml` is a commented starting po
 
 Models are dynamic: clients can call any model a provider offers, by name, and nothing needs to be listed in the config. A provider becomes available in one of three ways.
 
-**Built in.** These providers are known to the gateway and turn on as soon as they have a key: from the environment variable below, from a key added in the dashboard, or from a key the client sends with the request (`providerOptions.gateway.byok`). Until then their models go to `default_provider`. `<NAME>_BASE_URL` (for example `OPENAI_BASE_URL`) points one somewhere else, and `auto_providers: false` turns the list off.
+**Built in.** These providers are known to the gateway and turn on as soon as they have a key: from the environment variable below, from a key added in the dashboard, or from a key the client sends with the request (`providerOptions.gateway.byok`). Until then their models go to `default_provider`. `<NAME>_BASE_URL` (for example `OPENAI_BASE_URL`) points one somewhere else; it must be https, or http to localhost, or that provider is left out. `auto_providers: false` turns the list off.
+
+Because of this, setting `ANTHROPIC_API_KEY` in the gateway's environment moves `anthropic/...` requests from `default_provider` to Anthropic directly. Send `openrouter/anthropic/claude-sonnet-4.5` when you want OpenRouter regardless.
 
 | Name | Provider | Key from |
 |---|---|---|
@@ -152,7 +154,7 @@ Models are dynamic: clients can call any model a provider offers, by name, and n
 | `bedrock` | AWS Bedrock | `AWS_REGION` plus AWS credentials in the environment (keys, web identity, ECS role or `AWS_BEARER_TOKEN_BEDROCK`) |
 | `vertex` | Google Vertex AI | `GOOGLE_CLOUD_PROJECT` (and `GOOGLE_CLOUD_LOCATION`), with Google credentials |
 
-**From the dashboard.** On **Providers & routes → Add provider**, give any OpenAI-compatible, Anthropic, Azure, Bedrock or Vertex endpoint a name, URL and key. It reaches every replica within seconds. Keys are encrypted with `admin.encryption_key`.
+**From the dashboard.** On **Providers & routes → Add provider**, give any OpenAI-compatible, Anthropic, Azure, Bedrock or Vertex endpoint a name, URL and key. It reaches every replica within seconds. Keys are encrypted with `admin.encryption_key`. Changing a provider's URL needs its key again, so a key is never sent to a host it wasn't given for, and Bedrock and Vertex endpoints always come from their region. An entry that stops fitting the config (say, a route whose provider was removed) is skipped, shown with the reason, and can be deleted; the rest keep working.
 
 **In the config file**, for settings you want in version control. A provider here wins over a built-in one of the same name:
 

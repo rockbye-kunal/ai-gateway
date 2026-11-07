@@ -107,6 +107,7 @@ struct H {
     admin: String,
     mock: Arc<Mock>,
     http: reqwest::Client,
+    state: Arc<app::AppState>,
 }
 
 async fn start() -> H {
@@ -180,8 +181,9 @@ keys:
     let cfg = Config::from_yaml_str_with_env(&yaml, &|k| env.get(k).cloned()).expect("valid config");
     let state = app::AppState::build(cfg).await.unwrap();
     let gw = spawn(app::router(state.clone())).await;
-    let admin = spawn(app::admin_api_router(state)).await;
+    let admin = spawn(app::admin_api_router(state.clone())).await;
     let h = H {
+        state,
         base: format!("http://{gw}"),
         mock_url: format!("http://{m}"),
         admin: format!("http://{admin}"),
@@ -440,13 +442,28 @@ async fn providers_and_routes_from_the_dashboard() {
     let (_, hd, _) = h.chat(KEY, "local/my-model", json!({})).await;
     assert_eq!(provider_of(&hd), "openrouter", "unknown providers fall back to the default");
 
-    // A built-in provider can be pointed somewhere else from the dashboard.
+    // A built-in provider can be pointed somewhere else from the dashboard,
+    // but its environment key never follows it to the new host.
     let corp = format!("{}/corp", h.mock_url);
-    let (s, _) = h.put("/api/providers/openai", json!({"kind": "openai", "base_url": corp})).await;
+    let (s, v) = h.put("/api/providers/openai", json!({"kind": "openai", "base_url": corp})).await;
+    assert_eq!(s, 400, "a new endpoint needs its own key: {v}");
+    let (s, _) = h
+        .put("/api/providers/openai", json!({"kind": "openai", "base_url": corp, "api_key": "corp-key-2"}))
+        .await;
     assert_eq!(s, 200);
     let (_, hd, _) = h.chat(KEY, "openai/gpt-4o-mini", json!({})).await;
     assert_eq!(provider_of(&hd), "openai");
-    assert_eq!(h.last_call().0, "corp");
+    assert_eq!(h.last_call(), ("corp".into(), "gpt-4o-mini".into(), "Bearer corp-key-2".into()));
+
+    // Bedrock and Vertex sign with the gateway's own cloud credentials, so
+    // their endpoint can't be changed here.
+    let (s, _) = h
+        .put(
+            "/api/providers/aws",
+            json!({"kind": "bedrock", "region": "us-east-1", "base_url": "https://x.example"}),
+        )
+        .await;
+    assert_eq!(s, 400);
 
     // Every change is in the audit log.
     let (_, v) = h.admin_req(reqwest::Method::GET, "/api/audit", None).await;
@@ -467,4 +484,57 @@ fn config_needs_no_providers_or_keys_with_an_admin_token() {
     assert!(Config::from_yaml_str_with_env("{}", &env).is_err(), "no keys and no admin token");
     let off = format!("auto_providers: false\nadmin:\n  token_sha256: \"{}\"\n", hash_key(ADMIN));
     assert!(Config::from_yaml_str_with_env(&off, &env).is_err(), "no providers at all");
+}
+
+#[tokio::test]
+async fn a_bad_stored_entry_is_skipped_not_fatal() {
+    let h = start().await;
+    let ok = json!({"targets": [{"provider": "openai", "model": "gpt-4o-mini"}]});
+    assert_eq!(h.put("/api/routes/good", ok).await.0, 200);
+
+    // A route whose provider no longer exists, as after a config change or a
+    // race between two replicas, written straight to the store.
+    let bad = json!({"name": "broken", "targets": [{"provider": "gone", "model": "x"}]}).to_string();
+    h.state.store.hset("dashboard_routes", "broken", &bad).await.unwrap();
+    h.state.store.hset("dashboard_providers", "junk", "{not json").await.unwrap();
+    ai_gateway::admin::refresh_dynamic(&h.state).await.unwrap();
+
+    // Everything else keeps working, and new changes still apply.
+    let (s, hd, _) = h.chat(KEY, "good", json!({})).await;
+    assert_eq!((s.as_u16(), provider_of(&hd)), (200, "openai"));
+    let more = json!({"targets": [{"provider": "openrouter", "model": "openai/gpt-4o-mini"}]});
+    assert_eq!(h.put("/api/routes/more", more).await.0, 200);
+    let (_, hd, _) = h.chat(KEY, "more", json!({})).await;
+    assert_eq!(provider_of(&hd), "openrouter");
+
+    // The bad entries are listed with the reason, and can be deleted.
+    let (_, v) = h.admin_req(reqwest::Method::GET, "/api/routes", None).await;
+    let broken = v["data"].as_array().unwrap().iter().find(|r| r["name"] == "broken").cloned().unwrap();
+    assert!(broken["error"].as_str().unwrap().contains("unknown provider"), "{broken}");
+    let (_, v) = h.admin_req(reqwest::Method::GET, "/api/providers", None).await;
+    assert!(v["data"].as_array().unwrap().iter().any(|p| p["name"] == "junk" && p["error"].is_string()));
+    assert_eq!(h.admin_req(reqwest::Method::DELETE, "/api/routes/broken", None).await.0, 204);
+    assert_eq!(h.admin_req(reqwest::Method::DELETE, "/api/providers/junk", None).await.0, 204);
+    let (_, v) = h.admin_req(reqwest::Method::GET, "/api/routes", None).await;
+    assert!(!v["data"].as_array().unwrap().iter().any(|r| r["name"] == "broken" || r["error"].is_string()));
+}
+
+#[tokio::test]
+async fn model_lists_are_fetched_once_and_follow_key_changes() {
+    let h = start().await;
+    // Twenty clients asking at once on a cold cache cause one fetch each.
+    let calls = (0..20).map(|_| h.models(KEY, ""));
+    let results = futures::future::join_all(calls).await;
+    assert!(results.iter().all(|r| r.len() > 3));
+    assert_eq!(h.hits("openai"), 1);
+    assert_eq!(h.hits("router"), 1);
+
+    // A new key for a provider gets a new list: the cache follows the key.
+    let (s, _) = h
+        .admin_req(reqwest::Method::PUT, "/api/provider-keys/openai", Some(json!({"api_key": "sk-new"})))
+        .await;
+    assert_eq!(s, 204);
+    h.models(KEY, "").await;
+    assert_eq!(h.hits("openai"), 2);
+    assert_eq!(h.hits("router"), 1, "other providers stay cached");
 }

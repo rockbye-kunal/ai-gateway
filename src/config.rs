@@ -761,10 +761,16 @@ impl Config {
             }
             let mut p = p.clone();
             p.source = ProviderSource::Dashboard;
-            // Overriding a built-in provider (say, a new endpoint) keeps the
-            // key it has from the environment.
+            // Overriding a built-in provider keeps its environment key only
+            // while the endpoint is the same, so the key is never sent to a
+            // different host.
             if p.api_key.expose().is_empty() {
-                if let Some(o) = old.filter(|o| o.source == ProviderSource::Builtin) {
+                let same_endpoint = |o: &ProviderConfig| {
+                    o.kind == p.kind
+                        && (p.base_url.trim().is_empty()
+                            || o.base_url.trim_end_matches('/') == p.base_url.trim_end_matches('/'))
+                };
+                if let Some(o) = old.filter(|o| o.source == ProviderSource::Builtin && same_endpoint(o)) {
                     p.api_key = o.api_key.clone();
                 }
             }
