@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM rust:1.91-bookworm AS build
+FROM rust:1.98-bookworm AS build
 WORKDIR /src
 # Cache dependencies separately from source.
 COPY Cargo.toml Cargo.lock* ./
