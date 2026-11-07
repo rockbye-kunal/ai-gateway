@@ -465,6 +465,17 @@ async fn providers_and_routes_from_the_dashboard() {
         .await;
     assert_eq!(s, 400);
 
+    // A stored key whose provider isn't loaded right now still can't be
+    // pointed at a new host, and switching a provider's kind needs a key too.
+    let enc = h.state.cipher.as_ref().unwrap().encrypt("sk-ghost").unwrap();
+    h.state.store.hset("provider_keys", "ghost", &enc).await.unwrap();
+    ai_gateway::admin::refresh_dynamic(&h.state).await.unwrap();
+    let (s, _) =
+        h.put("/api/providers/ghost", json!({"kind": "openai", "base_url": "https://evil.example/v1"})).await;
+    assert_eq!(s, 400);
+    let (s, _) = h.put("/api/providers/openai", json!({"kind": "bedrock", "region": "us-east-1"})).await;
+    assert_eq!(s, 400);
+
     // Every change is in the audit log.
     let (_, v) = h.admin_req(reqwest::Method::GET, "/api/audit", None).await;
     let actions: Vec<&str> =
