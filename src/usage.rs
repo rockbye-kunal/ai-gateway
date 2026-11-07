@@ -28,8 +28,11 @@ use crate::{
 pub struct Usage {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
-    /// Prompt tokens served from the provider's prompt cache (or written to it).
+    /// Prompt tokens served from the provider's prompt cache.
     pub cached_tokens: u64,
+    /// Prompt tokens written to the provider's prompt cache (Anthropic,
+    /// Bedrock), billed at their own rate when the price is known.
+    pub cache_write_tokens: u64,
     pub reasoning_tokens: u64,
     /// Actual cost in micro-dollars when the provider reports it
     /// (OpenRouter's `usage.cost`). Preferred over configured prices.
@@ -71,19 +74,21 @@ impl Usage {
             .and_then(Value::as_f64)
             .filter(|c| c.is_finite() && *c >= 0.0)
             .map(|c| (c * 1_000_000.0).round() as u64);
-        let anthropic_cache =
-            u64_at(u, &["cache_read_input_tokens"]) + u64_at(u, &["cache_creation_input_tokens"]);
-        let prompt = u64_at(u, &["prompt_tokens"]).max(u64_at(u, &["input_tokens"]) + anthropic_cache);
+        let cache_read = u64_at(u, &["cache_read_input_tokens"]);
+        let cache_write = u64_at(u, &["cache_creation_input_tokens"]);
+        let prompt =
+            u64_at(u, &["prompt_tokens"]).max(u64_at(u, &["input_tokens"]) + cache_read + cache_write);
         let completion = u64_at(u, &["completion_tokens"]).max(u64_at(u, &["output_tokens"]));
         let cached = u64_at(u, &["prompt_tokens_details", "cached_tokens"])
             .max(u64_at(u, &["input_tokens_details", "cached_tokens"]))
-            .max(anthropic_cache);
+            .max(cache_read);
         let reasoning = u64_at(u, &["completion_tokens_details", "reasoning_tokens"])
             .max(u64_at(u, &["output_tokens_details", "reasoning_tokens"]));
         Usage {
             prompt_tokens: prompt,
             completion_tokens: completion,
             cached_tokens: cached,
+            cache_write_tokens: cache_write,
             reasoning_tokens: reasoning,
             cost_microusd,
         }
@@ -118,6 +123,7 @@ impl Usage {
         self.prompt_tokens = self.prompt_tokens.max(other.prompt_tokens);
         self.completion_tokens = self.completion_tokens.max(other.completion_tokens);
         self.cached_tokens = self.cached_tokens.max(other.cached_tokens);
+        self.cache_write_tokens = self.cache_write_tokens.max(other.cache_write_tokens);
         self.reasoning_tokens = self.reasoning_tokens.max(other.reasoning_tokens);
         if other.cost_microusd.is_some() {
             self.cost_microusd = other.cost_microusd;
@@ -137,8 +143,8 @@ pub struct RequestState {
     pub stream: bool,
     pub attempts: u32,
     pub usage: Usage,
-    pub price_input_per_mtok: Option<f64>,
-    pub price_output_per_mtok: Option<f64>,
+    /// Resolved price of the target that served the request.
+    pub price: Option<crate::pricing::Price>,
     /// Per-tenant concurrency slot, released when the request finishes.
     pub tenant_permit: Option<OwnedSemaphorePermit>,
     pub endpoint: &'static str,
@@ -291,11 +297,9 @@ fn compute_cost(st: &RequestState, billable: bool) -> Option<f64> {
             }
         });
     }
-    match (st.usage.cost_microusd, st.price_input_per_mtok, st.price_output_per_mtok) {
-        (Some(micro), _, _) => Some(micro as f64 / 1_000_000.0),
-        (None, Some(pi), Some(po)) => {
-            Some((st.usage.prompt_tokens as f64 * pi + st.usage.completion_tokens as f64 * po) / 1_000_000.0)
-        }
+    match (st.usage.cost_microusd, st.price) {
+        (Some(micro), _) => Some(micro as f64 / 1_000_000.0),
+        (None, Some(p)) => Some(p.cost(&st.usage)),
         _ => None,
     }
 }

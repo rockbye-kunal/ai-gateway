@@ -83,6 +83,7 @@ pub struct AppState {
     pub store: Store,
     pub http: reqwest::Client,
     pub stats: TargetStats,
+    pub pricing: crate::pricing::Pricing,
     pub exporter: Exporter,
     pub limiter: Arc<Semaphore>,
     /// False while draining for shutdown, so the load balancer stops routing here.
@@ -131,6 +132,7 @@ impl AppState {
             store,
             exporter,
             stats: TargetStats::default(),
+            pricing: Default::default(),
             ready: AtomicBool::new(true),
             pending_usage_writes: AtomicUsize::new(0),
             stream_cancel: watch::channel(false).0,
@@ -157,6 +159,18 @@ impl AppState {
                     metrics::counter!("gateway_store_errors_total", "op" => "key_refresh").increment(1);
                     tracing::warn!(error = %e, "refresh of admin settings failed; keeping the current ones");
                 }
+            }
+        });
+        // Model prices: loaded in the background so startup never waits on
+        // the network; `refresh` only downloads when the copy is stale.
+        let weak = Arc::downgrade(&state);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(3600));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let Some(app) = weak.upgrade() else { break };
+                app.pricing.refresh(&app, false).await;
             }
         });
         Ok(state)
@@ -262,6 +276,8 @@ pub fn admin_api_router(state: Arc<AppState>) -> Router {
         .route("/api/audit", get(admin::audit_log))
         .route("/api/config", get(admin::get_config))
         .route("/api/reload", post(admin::reload))
+        .route("/api/pricing", get(admin::pricing_status))
+        .route("/api/pricing/refresh", post(admin::refresh_pricing))
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .layer(DefaultBodyLimit::max(64 * 1024))

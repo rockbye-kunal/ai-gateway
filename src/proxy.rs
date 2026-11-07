@@ -111,7 +111,8 @@ impl Endpoint {
             Endpoint::Responses | Endpoint::Moderations | Endpoint::Rerank | Endpoint::Speech => {
                 kind == Openai
             }
-            Endpoint::Messages => kind == Anthropic,
+            // Vertex serves Messages for Claude models only; others get a 400.
+            Endpoint::Messages => matches!(kind, Anthropic | Vertex),
         }
     }
 
@@ -238,13 +239,14 @@ pub async fn list_models(
         .into_iter()
         .map(|id| {
             let r = &rt.routes[id];
-            let t = &r.targets[0];
+            let price = target_price(&app, &rt, &r.targets[0]);
             json!({
                 "id": id, "object": "model", "created": 0, "owned_by": "gateway",
                 "targets": r.targets.iter().map(|t| format!("{}/{}", t.provider, t.model)).collect::<Vec<_>>(),
                 "pricing": {
-                    "input_per_mtok": t.price_input_per_mtok,
-                    "output_per_mtok": t.price_output_per_mtok,
+                    "input_per_mtok": price.map(|p| p.input_per_mtok),
+                    "output_per_mtok": price.map(|p| p.output_per_mtok),
+                    "cached_input_per_mtok": price.and_then(|p| p.cached_input_per_mtok),
                 },
             })
         })
@@ -605,8 +607,19 @@ fn route_targets<'a>(
     (route.strategy, &route.targets)
 }
 
-fn price(t: &TargetConfig) -> f64 {
-    t.price_input_per_mtok.unwrap_or(f64::MAX / 4.0) + t.price_output_per_mtok.unwrap_or(f64::MAX / 4.0)
+/// The resolved price of a target (route prices, overrides, the price list).
+pub fn target_price(app: &AppState, rt: &Runtime, t: &TargetConfig) -> Option<crate::pricing::Price> {
+    let p = rt.providers.get(&t.provider)?;
+    app.pricing.lookup(&rt.cfg.pricing, &t.provider, &p.cfg, t).map(|(p, _)| p)
+}
+
+/// Sort key for cheapest-first ordering; unknown prices sort last.
+fn price(app: Option<&AppState>, t: &TargetConfig) -> f64 {
+    let known = match (t.price_input_per_mtok, t.price_output_per_mtok) {
+        (Some(i), Some(o)) => Some(i + o),
+        _ => app.and_then(|a| target_price(a, &a.rt(), t)).map(|p| p.input_per_mtok + p.output_per_mtok),
+    };
+    known.unwrap_or(f64::MAX / 2.0)
 }
 
 /// Target order for a route. `fallback` keeps the configured order;
@@ -621,7 +634,7 @@ pub fn order_targets(
     let mut out = targets.to_vec();
     match strategy {
         RouteStrategy::Fallback => {}
-        RouteStrategy::Cost => out.sort_by(|a, b| price(a).total_cmp(&price(b))),
+        RouteStrategy::Cost => out.sort_by(|a, b| price(app, a).total_cmp(&price(app, b))),
         RouteStrategy::Latency => {
             if let Some(app) = app {
                 // Targets with no measurement yet go first so they get one.
@@ -797,7 +810,7 @@ pub fn plan_targets(
         let metric = |t: &TargetConfig| -> f64 {
             let s = app.stats.get(&t.provider, &t.model);
             match sort {
-                Sort::Cost => price(t),
+                Sort::Cost => price(Some(app), t),
                 // Unmeasured targets first, so they get measured.
                 Sort::Latency => s.filter(|s| s.ttft_ms > 0.0).map_or(0.0, |s| s.ttft_ms),
                 Sort::Throughput => {
@@ -1022,7 +1035,7 @@ async fn try_target(ctx: &AttemptCtx<'_>, provider: &Provider, target: &TargetCo
     };
 
     let started = Instant::now();
-    let resp = match tokio::time::timeout(provider.timeout(), rb.send()).await {
+    let resp = match tokio::time::timeout(provider.timeout(), provider.send(rb, &key)).await {
         Err(_) => {
             provider_failed(ctx.app, provider);
             upstream_error_metric(&pname, "timeout");
@@ -1045,8 +1058,7 @@ async fn try_target(ctx: &AttemptCtx<'_>, provider: &Provider, target: &TargetCo
         ctx.guard.update(|s| {
             s.provider = Some(pname.clone());
             s.model = Some(target.model.clone());
-            s.price_input_per_mtok = target.price_input_per_mtok;
-            s.price_output_per_mtok = target.price_output_per_mtok;
+            s.price = target_price(ctx.app, &ctx.app.rt(), target);
             s.credential = Some(credential);
         });
         let sink = ctx.cache_key.map(|k| CacheSink {

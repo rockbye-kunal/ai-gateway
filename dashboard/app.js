@@ -684,13 +684,32 @@
           : el("div", { class: "meta", text: "No traffic on this replica yet." }))));
     let keys = null;
     try { keys = await api("/api/provider-keys"); } catch (_) {}
+    let pricing = null;
+    try { pricing = await api("/api/pricing"); } catch (_) {}
+    const per = (v) => v === null || v === undefined ? "–" : "$" + (+v.toFixed(4));
+    const prices = pricing ? el("section", { class: "panel flush", style: "margin-top:20px" },
+      el("div", { class: "page-head", style: "padding:12px 16px 0;margin:0" },
+        el("div", {}, el("h2", { style: "padding:0", text: "Model prices" }),
+          el("div", { class: "sub", text: !pricing.enabled ? "Price list off. Costs come from prices set in the config." :
+            pricing.models ? num(pricing.models) + " models in the price list, updated " + new Date(pricing.updated_at * 1000).toLocaleString() + "." :
+            "The price list has not loaded yet." })),
+        pricing.enabled ? el("button", { class: "btn", type: "button", text: "Update prices", onclick: refreshPricing }) : null),
+      el("div", { class: "table-wrap" }, pricing.targets.length ? el("table", {},
+        el("thead", {}, el("tr", {}, ["Route", "Target", "Input / M tokens", "Output / M tokens", "Cached input / M", "From"].map((h) => el("th", { text: h })))),
+        el("tbody", {}, pricing.targets.map((t) => el("tr", {},
+          el("td", { text: t.route }), el("td", { class: "trunc", text: t.target }),
+          el("td", { class: "num", text: t.price ? per(t.price.input_per_mtok) : "–" }),
+          el("td", { class: "num", text: t.price ? per(t.price.output_per_mtok) : "–" }),
+          el("td", { class: "num", text: t.price ? per(t.price.cached_input_per_mtok) : "–" }),
+          el("td", { text: ({ route: "Route config", override: "Override", list: "Price list" })[t.source] || "Unknown, no cost recorded" })))))
+        : el("div", { class: "empty", text: "No routes to price." }))) : null;
     const byok = keys ? el("section", { class: "panel flush" }, el("h2", { text: "Provider keys" }),
       el("p", { class: "sub", style: "padding:0 16px", text: keys.storage_enabled ? "Keys stored here are encrypted and replace the config file key on every replica within seconds." : "Set admin.encryption_key to store provider keys here instead of in the config file." }),
       el("div", { class: "table-wrap" }, el("table", {},
         el("thead", {}, el("tr", {}, ["Provider", "Key in use", "Clients may bring keys", ""].map((h) => el("th", { text: h })))),
         el("tbody", {}, keys.data.map((k) => el("tr", {},
           el("td", { text: k.provider }),
-          el("td", { text: (k.source === "stored" ? "Stored here " : "Config file ") + k.hint }),
+          el("td", { text: k.hint ? (k.source === "stored" ? "Stored here " : "Config file ") + k.hint : "Cloud credentials (AWS or Google)" }),
           el("td", { text: k.allow_client_keys ? "Yes" : "No" }),
           el("td", {}, keys.storage_enabled ? el("button", { class: "btn", type: "button", text: "Replace key", onclick: () => setProviderKey(k.provider) }) : null, " ",
             k.source === "stored" ? el("button", { class: "btn danger", type: "button", text: "Remove", onclick: () => removeProviderKey(k.provider) }) : null))))))) : null;
@@ -717,6 +736,7 @@
         el("section", { class: "panel flush" }, el("h2", { text: "Routes" }), el("div", { class: "table-wrap" }, routes),
           c.default_provider ? el("p", { class: "sub", style: "padding: 0 16px 12px", text: "Any other model goes to " + c.default_provider + "." }) : null),
         el("section", { class: "panel flush" }, el("h2", { text: "Guardrails" }), el("div", { class: "table-wrap" }, guards))),
+      prices,
       el("dl", { class: "kv", style: "margin-top: 20px" },
         el("dt", { text: "Response cache" }), el("dd", { text: c.cache.enabled ? "On, " + c.cache.ttl_secs + " s" : "Off" }),
         el("dt", { text: "Request log" }), el("dd", { text: c.logging.enabled ? "Last " + num(c.logging.max_entries) + " requests" : "Off" }),
@@ -731,6 +751,11 @@
       const r = await api("/api/reload", { method: "POST" });
       alert("Config reloaded." + (r.notes.length ? "\n\n" + r.notes.join("\n") : ""));
     } catch (e) { alert(e.message); }
+    renderSetup();
+  }
+
+  async function refreshPricing() {
+    try { await api("/api/pricing/refresh", { method: "POST" }); } catch (e) { alert(e.message); return; }
     renderSetup();
   }
 

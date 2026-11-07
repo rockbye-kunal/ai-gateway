@@ -298,7 +298,7 @@ async fn call_moderation(app: &AppState, rt: &Runtime, m: &ModerationConfig, tex
     let key = crate::proxy::credentials(app, provider, &Default::default()).0;
     let input: String = text.chars().take(32_000).collect();
     let rb = provider.build_json("moderations", &json!({"input": input}), &m.model, &key).ok()?;
-    let res = tokio::time::timeout(provider.timeout(), rb.send()).await;
+    let res = tokio::time::timeout(provider.timeout(), provider.send(rb, &key)).await;
     let body: Option<Value> = match res {
         Ok(Ok(r)) if r.status().is_success() => r.json().await.ok(),
         Ok(Ok(r)) => {

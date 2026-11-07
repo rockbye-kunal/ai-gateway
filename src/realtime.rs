@@ -141,8 +141,7 @@ async fn connect(
                 s.provider = Some(provider.name.clone());
                 s.model = Some(target.model.clone());
                 s.credential = Some(credential);
-                s.price_input_per_mtok = target.price_input_per_mtok;
-                s.price_output_per_mtok = target.price_output_per_mtok;
+                s.price = crate::proxy::target_price(app, &app.rt(), target);
             });
             Ok(stream)
         }

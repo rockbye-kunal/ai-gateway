@@ -225,6 +225,7 @@ async fn start_with(extra: &str) -> Harness {
         r#"
 {store}
 {extra}
+{pricing}
 server:
   listen: 127.0.0.1:0
   admin_listen: 127.0.0.1:0
@@ -287,6 +288,8 @@ keys:
     key_sha256: "{restricted}"
     allowed_models: ["smart"]
 "#,
+        // Tests never download the public price list.
+        pricing = if extra.contains("pricing:") { "" } else { "pricing:\n  enabled: false" },
         full = hash_key(KEY_FULL),
         limited = hash_key(KEY_LIMITED),
         budget = hash_key(KEY_BUDGET),
