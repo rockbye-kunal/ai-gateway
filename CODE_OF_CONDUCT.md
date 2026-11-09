@@ -22,7 +22,7 @@ This code applies in every project space: issues, pull requests, discussions, re
 
 ## Reporting
 
-If you experience or see behaviour that breaks this code, email the maintainer at **jeetu456rs@gmail.com**. Reports are handled privately, and we respect the privacy of whoever reports a problem.
+If you experience or see behaviour that breaks this code, contact the maintainer privately through their GitHub profile, [github.com/rockbye-kunal](https://github.com/rockbye-kunal), or use GitHub's **Report content** option on the comment, issue or pull request. Reports are handled privately, and we respect the privacy of whoever reports a problem.
 
 ## Enforcement
 
