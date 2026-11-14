@@ -25,7 +25,7 @@ aes-gcm = "0.10"
 anyhow = "1"
 async-stream = "0.3"
 axum = { version = "0.7", features = ["ws"] }
-base64 = "0.22"
+base64 = "0.23"
 dashmap = "6"
 futures = "0.3"
 hex = "0.4"
